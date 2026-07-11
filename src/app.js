@@ -1,43 +1,51 @@
 // ============================================================
-// Riki Fatigue Check — app.js v0.3.0
+// Riki Fatigue Check — app.js v0.4.0
 //
-// Major changes in this version:
-//   A. Personal baseline scoring (rolling 14-day, per-game,
-//      activates after 4+ sessions) via localStorage history.
-//      Score is now performance-relative-to-YOU, not a fixed
-//      universal scale.
-//   B. Context penalties REMOVED from scoring. Sleep / shift /
-//      symptoms / caffeine / self-rated fatigue are collected,
-//      submitted to Google Forms, and DISPLAYED as context on
-//      the results screen — but the score itself is driven by
-//      objective test performance only.
-//   C. Circadian multiplier removed (it unfairly penalised
-//      night-shift staff on every session).
-//   D. PVT fixed: lapse threshold back to literature-standard
-//      500 ms, inter-stimulus interval shortened to 1–4 s
-//      (PVT-B style → ~15-20 trials per minute instead of ~7),
-//      and a 3 s stimulus timeout so a full zone-out can't
-//      stall the test.
-//   E. 2-Back fixed: YES-only response design (no phantom NO
-//      button), missed-target bug at trial index 2 fixed,
-//      arbitrary score floor of 20 removed, scoring now uses
-//      hit rate minus false-alarm rate, 30 trials (~60 s).
-//   F. Stroop interference now measured the classic way: the
-//      REACTION-TIME gap between congruent and incongruent
-//      trials (accuracy is near ceiling for everyone, RT gap
-//      is the sensitive fatigue signal).
-//   G. 14-day trend graph (dependency-free inline SVG) on the
-//      results screen and via a "View my trend" button.
-//   H. Demo mode: add ?demo=1 to the URL to seed 12 realistic
-//      sessions of history for the entered alias (if it has
-//      fewer than 4 real sessions) and skip the cooldown —
-//      so judges can see baseline comparison + the trend graph
-//      working live from a single session.
+// New in this version (on top of v0.3.0's baseline scoring,
+// trend graph, PVT/2-Back/Stroop fixes, demo mode):
 //
-// Google Forms submission is unchanged — it remains the
-// research/archive pipeline. localStorage is the read layer
-// that powers baselines and the graph (device-bound: history
-// lives on the device it was recorded on).
+//   I. RT VARIABILITY captured per test. Fatigue's clearest
+//      signature is not slower responses but MORE VARIABLE
+//      ones — a long right tail of occasional very slow
+//      responses. We now compute, per test where applicable:
+//        - SD of reaction times
+//        - Coefficient of variation (CV = SD / mean), which
+//          normalises for how fast the person is overall
+//        - Mean of the slowest 10% of responses (the tail)
+//        - Mean of the fastest 10% (barely changes with
+//          fatigue — acts as a built-in control)
+//
+//   J. TIME-ON-TASK DECLINE per test: first half of the 60 s
+//      vs second half. Rested people hold steady; fatigued
+//      people start fine and fade. Measured as RT slowdown
+//      (PVT, Stroop), throughput decline (SDMT), accuracy
+//      drop (2-Back).
+//
+//   K. STABILITY INDEX (0–100): variability + decline across
+//      tests, combined into one channel that joins the
+//      composite at 15% weight and gets its own personal
+//      baseline like every game. Hard to fake by "trying
+//      hard" — effort can raise a median, but it can't easily
+//      suppress a fatigue tail or a second-half fade.
+//
+//   L. CONFIDENCE RATING (baseline mode): fatigue produces a
+//      COHERENT signature across independent measures; noise
+//      produces scattered ones. If several signals dip
+//      together, we say so; if only one signal dips while the
+//      rest look typical, the result is flagged as mixed and
+//      a recheck suggested.
+//
+//   M. PVT anticipation handling: responses under 100 ms are
+//      counted as false starts (literature standard), not as
+//      real reaction times.
+//
+//   N. METRICS LOG: full per-session metric detail (CVs,
+//      declines, tails) appended to localStorage
+//      (`metrics_<hash>`, last 60 sessions) for later
+//      analysis/validation. NOTE: the Google Form has no
+//      fields for these yet, so they are NOT submitted to
+//      Sheets — add form fields later if you want them
+//      archived centrally.
 // ============================================================
 
 // ===============================
@@ -157,13 +165,58 @@ function median(arr) {
   return sorted.length % 2 !== 0 ? sorted[mid] : Math.round((sorted[mid - 1] + sorted[mid]) / 2);
 }
 
-// Median Absolute Deviation — robust spread estimate.
-// One bad/outlier session won't wreck the baseline the way
-// a mean/SD would with only ~10 data points.
+function meanOf(arr) {
+  if (!arr || arr.length === 0) return 0;
+  return arr.reduce((a, b) => a + b, 0) / arr.length;
+}
+
+function sdOf(arr) {
+  if (!arr || arr.length < 2) return 0;
+  const m = meanOf(arr);
+  return Math.sqrt(arr.reduce((a, b) => a + (b - m) ** 2, 0) / arr.length);
+}
+
+// CHANGE I: coefficient of variation — spread normalised by speed,
+// so a naturally slow-but-consistent person isn't flagged as variable.
+function cvOf(arr) {
+  const m = meanOf(arr);
+  if (!arr || arr.length < 4 || m <= 0) return null;
+  return sdOf(arr) / m;
+}
+
+// CHANGE I: mean of the slowest / fastest fraction of responses.
+function tailMean(arr, fraction, slowest = true) {
+  if (!arr || arr.length < 4) return null;
+  const sorted = [...arr].sort((a, b) => (slowest ? b - a : a - b));
+  const n = Math.max(1, Math.round(arr.length * fraction));
+  return Math.round(meanOf(sorted.slice(0, n)));
+}
+
+// Median Absolute Deviation — robust spread for baselines.
 function mad(arr, center) {
   if (!arr || arr.length === 0) return 0;
   const deviations = arr.map((v) => Math.abs(v - center));
   return median(deviations);
+}
+
+// CHANGE J: split timestamped events into first/second half of a test.
+function splitHalves(events, durationSec) {
+  const midMs = (durationSec * 1000) / 2;
+  return {
+    h1: events.filter((e) => e.t < midMs),
+    h2: events.filter((e) => e.t >= midMs)
+  };
+}
+
+// CHANGE J: fractional RT slowdown from first to second half.
+// Positive = got slower. null if not enough data in either half.
+function rtDecline(rtEvents, durationSec, minPerHalf = 3) {
+  const { h1, h2 } = splitHalves(rtEvents, durationSec);
+  if (h1.length < minPerHalf || h2.length < minPerHalf) return null;
+  const m1 = median(h1.map((e) => e.rt));
+  const m2 = median(h2.map((e) => e.rt));
+  if (m1 <= 0) return null;
+  return Math.max(-1, Math.min(1, (m2 - m1) / m1));
 }
 
 function getTodayKeyUTC() {
@@ -228,15 +281,14 @@ function submitHiddenForm(url, fields) {
 }
 
 // ============================================================
-// CHANGE A: Session history store (the read layer)
+// Session history store
 // ============================================================
 const HISTORY_WINDOW_DAYS = 14;
-const BASELINE_MIN_SESSIONS = 4;   // per game, before baseline scoring activates
+const BASELINE_MIN_SESSIONS = 4;
 const DAY_MS = 86400000;
 
 function historyKey(aliasHash) { return `history_${aliasHash}`; }
 
-// Returns sessions from the last 14 days, oldest first.
 function getHistory(aliasHash) {
   let raw;
   try { raw = JSON.parse(localStorage.getItem(historyKey(aliasHash)) || "[]"); }
@@ -248,29 +300,36 @@ function getHistory(aliasHash) {
 }
 
 function saveSessionToHistory(aliasHash, entry) {
-  const hist = getHistory(aliasHash); // already trimmed to window
+  const hist = getHistory(aliasHash);
   hist.push(entry);
   localStorage.setItem(historyKey(aliasHash), JSON.stringify(hist));
 }
 
-// Per-game baseline stats from the user's own history.
-// Returns null until this game has BASELINE_MIN_SESSIONS data points.
-function baselineStatsFor(history, gameKey) {
+// Per-channel baseline stats from the user's own history.
+// Works for game scores AND the stability index (any numeric key).
+function baselineStatsFor(history, key) {
   const values = history
-    .map((h) => h[gameKey])
+    .map((h) => h[key])
     .filter((v) => typeof v === "number" && !isNaN(v));
   if (values.length < BASELINE_MIN_SESSIONS) return null;
   const center = median(values);
-  // Floor the spread at 5 points so a very consistent user's tiny
-  // variance doesn't turn a 3-point dip into an extreme z-score.
   const sd = Math.max(mad(values, center) * 1.4826, 5);
   return { center, sd, n: values.length };
 }
 
+// CHANGE N: append full metric detail for later analysis/validation.
+function appendMetricsLog(aliasHash, record) {
+  const key = `metrics_${aliasHash}`;
+  let log;
+  try { log = JSON.parse(localStorage.getItem(key) || "[]"); }
+  catch { log = []; }
+  log.push(record);
+  if (log.length > 60) log = log.slice(log.length - 60);
+  localStorage.setItem(key, JSON.stringify(log));
+}
+
 // ============================================================
-// CHANGE H: Demo mode (?demo=1)
-// Seeds realistic history so judges can see baseline scoring
-// and the trend graph from a single live session.
+// Demo mode (?demo=1)
 // ============================================================
 function isDemoMode() {
   return new URLSearchParams(window.location.search).get("demo") === "1";
@@ -280,22 +339,24 @@ function seedDemoHistory(aliasHash) {
   const existing = getHistory(aliasHash);
   if (existing.length >= BASELINE_MIN_SESSIONS) return false;
 
-  const base = { pvt: 74, sdmt: 66, stroop: 72, nback: 62 };
+  const base = { pvt: 74, sdmt: 66, stroop: 72, nback: 62, stability: 72 };
   const jitter = () => Math.round(Math.random() * 10 - 5);
   const entries = [];
   const now = nowMs();
 
   for (let daysAgo = 13; daysAgo >= 1; daysAgo--) {
-    if (daysAgo === 8 || daysAgo === 3) continue; // realistic missed days
-    // A mild mid-window dip so the graph tells a story.
+    if (daysAgo === 8 || daysAgo === 3) continue;
     const dip = daysAgo >= 4 && daysAgo <= 6 ? -10 : 0;
     const s = {
-      pvt:    clamp0to100(base.pvt + dip + jitter()),
-      sdmt:   clamp0to100(base.sdmt + dip + jitter()),
-      stroop: clamp0to100(base.stroop + dip + jitter()),
-      nback:  clamp0to100(base.nback + dip + jitter())
+      pvt:       clamp0to100(base.pvt + dip + jitter()),
+      sdmt:      clamp0to100(base.sdmt + dip + jitter()),
+      stroop:    clamp0to100(base.stroop + dip + jitter()),
+      nback:     clamp0to100(base.nback + dip + jitter()),
+      stability: clamp0to100(base.stability + dip + jitter())
     };
-    const overall = Math.round(s.pvt * 0.4 + s.sdmt * 0.2 + s.stroop * 0.2 + s.nback * 0.2);
+    const overall = Math.round(
+      s.pvt * 0.34 + s.sdmt * 0.17 + s.stroop * 0.17 + s.nback * 0.17 + s.stability * 0.15
+    );
     entries.push({
       ts: now - daysAgo * DAY_MS - Math.floor(Math.random() * 5) * 3600000,
       ...s,
@@ -324,17 +385,18 @@ let GAME_RESULTS = { sdmt: null, nback: null, stroop: null, pvt: null };
 
 const FLOW = [
   { key: "sdmt",   title: "SDMT",   text: "A key at the top shows 9 symbols, each paired with a number. A symbol appears in the centre — press the matching number as fast as you can. You have 4 seconds per symbol before it counts as incorrect." },
-  // CHANGE E: instructions now match the YES-only design.
   { key: "nback",  title: "2-Back", text: "Letters appear one at a time. Press YES only when the letter matches the one shown 2 steps ago. If it doesn't match, don't press anything. Stay focused — it gets tricky!" },
   { key: "stroop", title: "Stroop", text: "A colour word will appear on screen printed in a different ink colour. Tap the button matching the INK COLOUR — ignore what the word says. Respond as quickly and accurately as you can. You have 60 seconds." },
-  // CHANGE D: delay text updated to 1–4 s.
   { key: "pvt",    title: "PVT",    text: "A red dot will appear on screen after a short random delay (1-4 seconds). Tap it as fast as you can. Do NOT tap before it appears — that counts as a false start. You have 60 seconds." }
 ];
 
 let flowIndex = 0;
 
 // ===============================
-// SDMT Game — logic unchanged (v0.2.2 curve retained)
+// SDMT Game
+// CHANGE I & J: per-answer RTs and timestamped events recorded so
+// we can compute RT variability and first-half vs second-half
+// throughput decline. Gameplay and UI unchanged.
 // ===============================
 function runSDMT({ durationSec = 60, trialTimeoutSec = 4, onDone }) {
   const SYMBOLS = ["▭", "◯", "∧", "⊕", "≡", "⇔", "◄", "∴", "Ψ"];
@@ -348,6 +410,9 @@ function runSDMT({ durationSec = 60, trialTimeoutSec = 4, onDone }) {
 
   let correct = 0, incorrect = 0, trials = 0;
   let currentSymbol = SYMBOLS[Math.floor(Math.random() * SYMBOLS.length)];
+
+  // CHANGE I & J: event log {t: elapsed ms, correct: bool, rt: ms|null}
+  const events = [];
 
   hide("explainSection");
   show("gameSection");
@@ -412,6 +477,7 @@ function runSDMT({ durationSec = 60, trialTimeoutSec = 4, onDone }) {
     trialTimeoutHandle = setTimeout(() => {
       if (ended) return;
       incorrect++;
+      events.push({ t: Date.now() - startMs, correct: false, rt: null }); // CHANGE J
       feedbackEl.textContent = `⏱ Too slow! (was ${mapSymbolToDigit.get(currentSymbol)})`;
       feedbackEl.style.color = "#c00";
       incorrectEl.textContent = String(incorrect);
@@ -431,8 +497,11 @@ function runSDMT({ durationSec = 60, trialTimeoutSec = 4, onDone }) {
   function handleAnswer(n) {
     if (ended) return;
     clearTimeout(trialTimeoutHandle);
+    const rt = Date.now() - trialStartMs; // CHANGE I: per-answer RT
     const correctDigit = mapSymbolToDigit.get(currentSymbol);
-    if (n === correctDigit) { correct++; feedbackEl.textContent = "✓ Correct"; feedbackEl.style.color = "#080"; }
+    const isCorrect = n === correctDigit;
+    events.push({ t: Date.now() - startMs, correct: isCorrect, rt });
+    if (isCorrect) { correct++; feedbackEl.textContent = "✓ Correct"; feedbackEl.style.color = "#080"; }
     else { incorrect++; feedbackEl.textContent = `✗ Incorrect (was ${correctDigit})`; feedbackEl.style.color = "#c00"; }
     correctEl.textContent = String(correct);
     incorrectEl.textContent = String(incorrect);
@@ -463,16 +532,35 @@ function runSDMT({ durationSec = 60, trialTimeoutSec = 4, onDone }) {
       else                      { mappedScore = 85 + ((effective - 40) / 5) * 15; }
       score = clamp0to100(Math.round(mappedScore));
     }
-    onDone?.({ correct, incorrect, trials, score_0_100: score });
+
+    // CHANGE I: RT variability on answered trials.
+    const answeredRTs = events.filter((e) => e.rt !== null).map((e) => e.rt);
+    const rt_cv = cvOf(answeredRTs);
+
+    // CHANGE J: throughput decline — effective correct per second,
+    // first half vs second half.
+    let throughput_decline = null;
+    const { h1, h2 } = splitHalves(events, durationSec);
+    if (h1.length >= 4 && h2.length >= 4) {
+      const eff = (evts) =>
+        evts.filter((e) => e.correct).length - 0.25 * evts.filter((e) => !e.correct).length;
+      const halfSec = durationSec / 2;
+      const r1 = eff(h1) / halfSec, r2 = eff(h2) / halfSec;
+      if (r1 > 0.05) throughput_decline = Math.max(-1, Math.min(1, (r1 - r2) / r1));
+    }
+
+    onDone?.({
+      correct, incorrect, trials, score_0_100: score,
+      rt_cv, throughput_decline,
+      median_rt_ms: median(answeredRTs)
+    });
   }
 }
 
 // ===============================
 // 2-Back Game
-// CHANGE E: YES-only design made explicit, missed-target bug at
-// the first scoreable trial fixed, score floor removed, scoring
-// now hit rate minus false-alarm rate, 30 trials (~60 s).
-// UI unchanged apart from the hint text.
+// CHANGE J: per-trial outcomes recorded so first-half vs
+// second-half accuracy decline can be computed.
 // ===============================
 function runNBack({ rounds = 30, nBack = 2, onDone }) {
   const LETTERS = "BCDFGHJKLMNPQRSTVWXYZ".split("");
@@ -523,6 +611,10 @@ function runNBack({ rounds = 30, nBack = 2, onDone }) {
   let trialIndex = 0, hits = 0, misses = 0, falseAlarms = 0;
   let responded = false, isTarget = false, displayTimer = null, isiTimer = null, ended = false;
 
+  // CHANGE J: {idx, ok} per scoreable trial (ok = correct decision,
+  // whether that was a hit or a correct rejection).
+  const trialOutcomes = [];
+
   function setButtons(enabled) {
     yesBtn.disabled = !enabled;
     yesBtn.style.opacity = enabled ? "1" : "0.4";
@@ -530,10 +622,13 @@ function runNBack({ rounds = 30, nBack = 2, onDone }) {
   function showFeedback(text, color) { feedbackEl.textContent = text; feedbackEl.style.color = color; }
 
   function recordNoResponse() {
-    // CHANGE E (bug fix): was `trialIndex > nBack`, which silently
-    // ignored a missed target on the FIRST scoreable trial (index 2).
-    if (trialIndex >= nBack && !responded && isTarget) {
-      misses++; missesEl.textContent = String(misses); showFeedback("✗ Miss", "#c00");
+    if (trialIndex >= nBack && !responded) {
+      if (isTarget) {
+        misses++; missesEl.textContent = String(misses); showFeedback("✗ Miss", "#c00");
+        trialOutcomes.push({ idx: trialIndex, ok: false });
+      } else {
+        trialOutcomes.push({ idx: trialIndex, ok: true }); // correct rejection
+      }
     }
   }
 
@@ -555,8 +650,13 @@ function runNBack({ rounds = 30, nBack = 2, onDone }) {
     if (ended || trialIndex < nBack || responded) return;
     responded = true;
     clearTimeout(isiTimer);
-    if (isTarget) { hits++;       hitsEl.textContent = String(hits);        showFeedback("✓ Hit!", "#080"); }
-    else          { falseAlarms++; faEl.textContent   = String(falseAlarms); showFeedback("✗ False alarm", "#c00"); }
+    if (isTarget) {
+      hits++; hitsEl.textContent = String(hits); showFeedback("✓ Hit!", "#080");
+      trialOutcomes.push({ idx: trialIndex, ok: true });
+    } else {
+      falseAlarms++; faEl.textContent = String(falseAlarms); showFeedback("✗ False alarm", "#c00");
+      trialOutcomes.push({ idx: trialIndex, ok: false });
+    }
     isiTimer = setTimeout(() => { trialIndex++; runTrial(); }, 600);
   }
 
@@ -574,24 +674,33 @@ function runNBack({ rounds = 30, nBack = 2, onDone }) {
     const targetCount = sequence.filter((_, i) => i >= nBack && sequence[i] === sequence[i - nBack]).length;
     const nonTargetCount = Math.max(0, scoreable - targetCount);
 
-    // CHANGE E: hit rate minus false-alarm rate (simple d'-style
-    // discrimination measure). No-response-to-everything now
-    // scores 0, not an arbitrary 20.
     const hitRate = targetCount > 0 ? hits / targetCount : 0;
     const faRate  = nonTargetCount > 0 ? falseAlarms / nonTargetCount : 0;
     let score = clamp0to100(Math.round((hitRate - faRate) * 100));
     if (rounds < 20) score = null;
-    onDone?.({ hits, misses, false_alarms: falseAlarms, score_0_100: score });
+
+    // CHANGE J: accuracy decline, first half vs second half of
+    // scoreable trials. Positive = got worse.
+    let accuracy_decline = null;
+    if (trialOutcomes.length >= 12) {
+      const midIdx = nBack + Math.floor(scoreable / 2);
+      const h1 = trialOutcomes.filter((o) => o.idx < midIdx);
+      const h2 = trialOutcomes.filter((o) => o.idx >= midIdx);
+      if (h1.length >= 6 && h2.length >= 6) {
+        const acc = (arr) => arr.filter((o) => o.ok).length / arr.length;
+        accuracy_decline = Math.max(-1, Math.min(1, acc(h1) - acc(h2)));
+      }
+    }
+
+    onDone?.({ hits, misses, false_alarms: falseAlarms, score_0_100: score, accuracy_decline });
   }
   runTrial();
 }
 
 // ===============================
 // Stroop Game
-// CHANGE F: interference is now the classic RT-based measure —
-// the gap between median incongruent RT and median congruent RT.
-// Accuracy sits near ceiling for almost everyone, so the RT gap
-// is the sensitive fatigue signal. UI and trial generation unchanged.
+// CHANGE I & J: RT CV and first-half vs second-half RT slowdown
+// recorded (correct trials only). Gameplay and UI unchanged.
 // ===============================
 function runStroop({ durationSec = 60, onDone }) {
   const COLOURS = [
@@ -631,7 +740,8 @@ function runStroop({ durationSec = 60, onDone }) {
 
   let correct = 0, incorrect = 0;
   const reactionTimes = [];
-  const congruentRTs = [], incongruentRTs = []; // CHANGE F
+  const congruentRTs = [], incongruentRTs = [];
+  const rtEvents = []; // CHANGE J: {t, rt} for decline
   let trialStart = 0, currentInkColour = "", currentIsCongruent = false, ended = false;
 
   function nextTrial() {
@@ -661,7 +771,7 @@ function runStroop({ durationSec = 60, onDone }) {
     const rt = Date.now() - trialStart;
     if (chosen === currentInkColour) {
       correct++; reactionTimes.push(rt);
-      // CHANGE F: bank RTs per congruency (correct trials only)
+      rtEvents.push({ t: Date.now() - startMs, rt }); // CHANGE J
       if (currentIsCongruent) congruentRTs.push(rt); else incongruentRTs.push(rt);
       feedbackEl.textContent = "✓ Correct"; feedbackEl.style.color = "#080";
       correctEl.textContent = String(correct);
@@ -687,37 +797,36 @@ function runStroop({ durationSec = 60, onDone }) {
 
     if (total >= 10) {
       const accuracy = total > 0 ? correct / total : 0;
-      // CHANGE F: RT-based interference. Needs a few trials of
-      // each type to be meaningful; otherwise treated as 0.
       let interferenceMs = 0;
       if (congruentRTs.length >= 3 && incongruentRTs.length >= 3) {
         interferenceMs = Math.max(0, median(incongruentRTs) - median(congruentRTs));
       }
-      // 0–50 ms gap = normal, no penalty; 450 ms+ gap = maximum.
       const interferenceNorm = clamp01((interferenceMs - 50) / 400);
       const speedScore = clamp01((1200 - medianRt) / 800);
       const rawScore = accuracy * 0.5 + speedScore * 0.3 + (1 - interferenceNorm) * 0.2;
       score = clamp0to100(Math.round(rawScore * 100));
     }
-    onDone?.({ correct, incorrect, median_rt_ms: medianRt, score_0_100: score });
+
+    onDone?.({
+      correct, incorrect, median_rt_ms: medianRt, score_0_100: score,
+      rt_cv: cvOf(reactionTimes),                    // CHANGE I
+      rt_decline: rtDecline(rtEvents, durationSec)   // CHANGE J
+    });
   }
 }
 
 // ===============================
 // PVT Game
-// CHANGE D:
-//   - Lapse threshold restored to the literature-standard 500 ms
-//     (450 ms + touchscreen input latency was flagging normal
-//     alert responses as lapses).
-//   - Inter-stimulus interval shortened to 1–4 s (PVT-B style),
-//     roughly tripling trials per minute — far less noisy median.
-//   - 3 s stimulus timeout: a complete zone-out (the exact person
-//     this device exists to catch) now counts as a lapse and the
-//     test moves on, instead of stalling for the rest of the minute.
+// CHANGE I, J, M:
+//   - Full RT distribution metrics: SD, CV, slowest-10% mean
+//     (the fatigue tail), fastest-10% mean (control).
+//   - First-half vs second-half RT slowdown.
+//   - Anticipations (<100 ms) counted as false starts, not RTs.
 // ===============================
 function runPVT({ durationSec = 60, minDelaySec = 1, maxDelaySec = 4, onDone }) {
-  const LAPSE_THRESHOLD_MS = 500;      // CHANGE D
-  const STIMULUS_TIMEOUT_MS = 3000;    // CHANGE D
+  const LAPSE_THRESHOLD_MS = 500;
+  const STIMULUS_TIMEOUT_MS = 3000;
+  const ANTICIPATION_MS = 100; // CHANGE M
 
   hide("explainSection"); show("gameSection");
   const gameTitle = document.getElementById("gameTitle");
@@ -747,6 +856,7 @@ function runPVT({ durationSec = 60, minDelaySec = 1, maxDelaySec = 4, onDone }) 
   const lastRtEl      = document.getElementById("pvtLastRT");
 
   const reactionTimes = [];
+  const rtEvents = []; // CHANGE J: {t, rt}
   let lapses = 0, falseStarts = 0, timeouts = 0, stimulusOn = false, stimulusStart = 0;
   let waitHandle = null, ended = false, trials = 0;
   let respondedThisTrial = false, currentTrialLapseCounted = false;
@@ -775,7 +885,6 @@ function runPVT({ durationSec = 60, minDelaySec = 1, maxDelaySec = 4, onDone }) 
       }
     }, LAPSE_THRESHOLD_MS);
 
-    // CHANGE D: full non-response — count it, move on.
     stimulusTimeoutHandle = setTimeout(() => {
       if (ended || !stimulusOn || respondedThisTrial) return;
       timeouts++;
@@ -805,10 +914,25 @@ function runPVT({ durationSec = 60, minDelaySec = 1, maxDelaySec = 4, onDone }) 
       feedbackEl.textContent = "✗ Too early! (false start)"; feedbackEl.style.color = "#e65100";
       return;
     }
+    const rt = Date.now() - stimulusStart;
+
+    // CHANGE M: sub-100 ms "responses" are anticipations — the tap
+    // was launched before the stimulus was perceived. Standard PVT
+    // practice is to count them as false starts, not reaction times.
+    if (rt < ANTICIPATION_MS) {
+      falseStarts++; falseStartsEl.textContent = String(falseStarts);
+      feedbackEl.textContent = "✗ Too early! (anticipation)"; feedbackEl.style.color = "#e65100";
+      respondedThisTrial = true;
+      clearTimeout(lapseTimerHandle); clearTimeout(stimulusTimeoutHandle);
+      hideStimulus(); scheduleNext();
+      setTimeout(() => { if (!ended) feedbackEl.style.color = ""; }, 700);
+      return;
+    }
+
     respondedThisTrial = true;
     clearTimeout(lapseTimerHandle); clearTimeout(stimulusTimeoutHandle);
-    const rt = Date.now() - stimulusStart;
     reactionTimes.push(rt);
+    rtEvents.push({ t: Date.now() - startMs, rt }); // CHANGE J
     responsesEl.textContent = String(reactionTimes.length);
     lastRtEl.textContent = rt + " ms";
     if (rt >= LAPSE_THRESHOLD_MS) {
@@ -836,37 +960,92 @@ function runPVT({ durationSec = 60, minDelaySec = 1, maxDelaySec = 4, onDone }) 
     const fsPenalty    = clamp01(fsRate * 0.4);
     const rawScore     = speedScore * (1 - clamp01(lapsePenalty + fsPenalty));
     let score = clamp0to100(Math.round(rawScore * 100));
-    // Need a sensible number of trials AND actual responses for a valid median.
     if (trials < 8 || reactionTimes.length < 5) score = null;
-    onDone?.({ median_rt_ms: medianRt, lapses, false_starts: falseStarts, timeouts, score_0_100: score });
+
+    onDone?.({
+      median_rt_ms: medianRt, lapses, false_starts: falseStarts, timeouts,
+      score_0_100: score,
+      rt_sd: Math.round(sdOf(reactionTimes)),          // CHANGE I
+      rt_cv: cvOf(reactionTimes),                       // CHANGE I
+      slow10_ms: tailMean(reactionTimes, 0.1, true),    // CHANGE I: the fatigue tail
+      fast10_ms: tailMean(reactionTimes, 0.1, false),   // CHANGE I: the control
+      rt_decline: rtDecline(rtEvents, durationSec)      // CHANGE J
+    });
   }
 }
 
 // ============================================================
-// CHANGES A, B, C: Scoring
+// CHANGE K: Stability index (0–100)
 //
-// The score is now driven purely by objective test performance.
-// Once a game has 4+ sessions of history, today's raw game score
-// is converted to a PERSONAL score:
+// Combines RT variability (CV) and time-on-task decline across
+// tests into one channel. Each raw metric maps linearly to a
+// 0–1 sub-score between a "typical alert" value (→ 1) and a
+// "clearly impaired" value (→ 0):
 //
-//     z = (today − your 14-day median) / your robust SD
-//     personal = 75 + z × 12        (75 = "your normal")
+//   PVT CV:      0.15 → 1,  0.45 → 0
+//   Stroop CV:   0.20 → 1,  0.55 → 0
+//   SDMT CV:     0.20 → 1,  0.55 → 0
+//   RT slowdown (PVT/Stroop):      0%  → 1,  +30% → 0
+//   SDMT throughput decline:       0%  → 1,  +35% → 0
+//   2-Back accuracy decline:       0   → 1,  0.35 → 0
 //
-// The composite is the weighted average of personal scores
-// (falling back to the raw score for games without a baseline
-// yet). Banding is deviation-based in baseline mode:
+// stability = 100 × (0.5 × mean(variability subs)
+//                  + 0.5 × mean(decline subs))
 //
-//     ≥ 69  Green      (within ~0.5 SD of your normal)
-//     ≥ 57  Amber      (0.5–1.5 SD below)
-//     ≥ 45  Amber-Red  (1.5–2.5 SD below)
-//     < 45  Red        (> 2.5 SD below)
-//
-// Sleep / shift / symptoms are no longer subtracted — they are
-// shown as context alongside the score. The circadian multiplier
-// is gone: a 3 am session is now compared against your own
-// history, not handicapped by a blanket night-time haircut.
+// These anchors are literature-informed starting points, NOT
+// validated constants — but crucially the stability index gets
+// its own personal baseline, so what ultimately matters is how
+// today's stability compares to YOUR usual stability, which
+// makes the absolute anchors much less load-bearing.
 // ============================================================
-const GAME_WEIGHTS = { pvt: 0.40, sdmt: 0.20, stroop: 0.20, nback: 0.20 };
+function linMap(value, goodAt, badAt) {
+  if (value === null || value === undefined || isNaN(value)) return null;
+  return clamp01((badAt - value) / (badAt - goodAt));
+}
+
+function computeStability(results) {
+  const varSubs = [];
+  const decSubs = [];
+
+  const pvt = results.pvt, sdmt = results.sdmt, stroop = results.stroop, nback = results.nback;
+
+  const vPvt    = linMap(pvt?.rt_cv,    0.15, 0.45);
+  const vStroop = linMap(stroop?.rt_cv, 0.20, 0.55);
+  const vSdmt   = linMap(sdmt?.rt_cv,   0.20, 0.55);
+  if (vPvt    !== null) varSubs.push(vPvt);
+  if (vStroop !== null) varSubs.push(vStroop);
+  if (vSdmt   !== null) varSubs.push(vSdmt);
+
+  // Improvement in the second half (negative decline) is treated as
+  // 0 decline, not a bonus — warming up shouldn't inflate the score.
+  const d = (val, badAt) =>
+    val === null || val === undefined || isNaN(val) ? null : linMap(Math.max(0, val), 0, badAt);
+  const dPvt    = d(pvt?.rt_decline, 0.30);
+  const dStroop = d(stroop?.rt_decline, 0.30);
+  const dSdmt   = d(sdmt?.throughput_decline, 0.35);
+  const dNback  = d(nback?.accuracy_decline, 0.35);
+  if (dPvt    !== null) decSubs.push(dPvt);
+  if (dStroop !== null) decSubs.push(dStroop);
+  if (dSdmt   !== null) decSubs.push(dSdmt);
+  if (dNback  !== null) decSubs.push(dNback);
+
+  // Need at least one of each family (or two of one) to be meaningful.
+  if (varSubs.length + decSubs.length < 2) return null;
+
+  let stab01;
+  if (varSubs.length && decSubs.length) {
+    stab01 = 0.5 * meanOf(varSubs) + 0.5 * meanOf(decSubs);
+  } else {
+    stab01 = meanOf(varSubs.length ? varSubs : decSubs);
+  }
+  return clamp0to100(Math.round(stab01 * 100));
+}
+
+// ============================================================
+// Scoring pipeline
+// ============================================================
+// CHANGE K: stability joins the composite as a fifth channel.
+const CHANNEL_WEIGHTS = { pvt: 0.34, sdmt: 0.17, stroop: 0.17, nback: 0.17, stability: 0.15 };
 
 function scoreToBandAbsolute(score) {
   if (score >= 75) return "Green";
@@ -882,33 +1061,38 @@ function scoreToBandBaseline(score) {
   return "Red";
 }
 
-function computeSessionScore(results, history) {
-  const perGame = {};
-  let total = 0, wSum = 0, baselineGamesUsed = 0;
+function computeSessionScore(results, stability, history) {
+  const channelValues = {
+    pvt:    results.pvt?.score_0_100,
+    sdmt:   results.sdmt?.score_0_100,
+    stroop: results.stroop?.score_0_100,
+    nback:  results.nback?.score_0_100,
+    stability
+  };
 
-  for (const [key, w] of Object.entries(GAME_WEIGHTS)) {
-    const r = results[key];
-    if (!r || typeof r.score_0_100 !== "number") continue;
-    const abs = r.score_0_100;
+  const perChannel = {};
+  let total = 0, wSum = 0, baselineChannelsUsed = 0;
+
+  for (const [key, w] of Object.entries(CHANNEL_WEIGHTS)) {
+    const abs = channelValues[key];
+    if (typeof abs !== "number" || isNaN(abs)) continue;
     const stats = baselineStatsFor(history, key);
     let effective = abs, z = null, personal = null;
     if (stats) {
       z = (abs - stats.center) / stats.sd;
       personal = clamp0to100(Math.round(75 + z * 12));
       effective = personal;
-      baselineGamesUsed++;
+      baselineChannelsUsed++;
     }
-    perGame[key] = { abs, personal, z, baseline: stats ? stats.center : null };
+    perChannel[key] = { abs, personal, z, baseline: stats ? stats.center : null };
     total += effective * w;
     wSum += w;
   }
 
   const composite = wSum > 0 ? Math.round(total / wSum) : 0;
-  const mode = baselineGamesUsed >= 3 ? "baseline" : "absolute";
+  const mode = baselineChannelsUsed >= 3 ? "baseline" : "absolute";
   const band = mode === "baseline" ? scoreToBandBaseline(composite) : scoreToBandAbsolute(composite);
 
-  // Delta vs the user's recent overall average (for the headline
-  // "N points below your 2-week average" line).
   const priorOveralls = history
     .map((h) => h.overall)
     .filter((v) => typeof v === "number" && !isNaN(v));
@@ -918,11 +1102,22 @@ function computeSessionScore(results, history) {
     delta = composite - avg;
   }
 
-  return { composite, band, mode, baselineGamesUsed, perGame, delta, priorSessions: history.length };
+  // CHANGE L: signal-agreement confidence. Fatigue produces a
+  // coherent dip across independent measures; noise scatters.
+  let confidence = null;
+  if (mode === "baseline") {
+    const zs = Object.values(perChannel)
+      .map((c) => c.z)
+      .filter((z) => typeof z === "number" && !isNaN(z));
+    const lowCount = zs.filter((z) => z <= -1).length;
+    if (band !== "Green" && zs.length >= 3) {
+      confidence = lowCount <= 1 ? "mixed" : lowCount >= 3 ? "consistent" : "moderate";
+    }
+  }
+
+  return { composite, band, mode, baselineChannelsUsed, perChannel, delta, confidence, priorSessions: history.length };
 }
 
-// CHANGE B: advice softened to wellness-companion register —
-// the device helps you notice changes, it doesn't issue orders.
 function adviceFor(band, mode) {
   if (mode === "baseline") {
     if (band === "Green")     return "You're performing at or around your usual level. No unusual signs of fatigue in today's results — recheck after your next break if you'd like to keep tracking.";
@@ -936,14 +1131,27 @@ function adviceFor(band, mode) {
   return "Significant signs of reduced performance. Rest is recommended when you're able, and consider rechecking after a break.";
 }
 
+function confidenceNoteHTML(confidence) {
+  if (confidence === "mixed") {
+    return `<div style="background:#e3f2fd;border:1px solid #90caf9;border-radius:8px;padding:10px 14px;margin-top:12px;font-size:14px;line-height:1.5;color:#0d47a1;">
+      <b>Mixed signals:</b> only one measure was clearly below your baseline while the others looked typical, so treat this result with lower confidence. A recheck after a short break will tell you more.
+    </div>`;
+  }
+  if (confidence === "consistent") {
+    return `<div style="background:#fce4ec;border:1px solid #f48fb1;border-radius:8px;padding:10px 14px;margin-top:12px;font-size:14px;line-height:1.5;color:#880e4f;">
+      <b>Consistent signals:</b> several independent measures dipped below your baseline together, which increases confidence in this result.
+    </div>`;
+  }
+  return "";
+}
+
 function bandColour(band) {
   const map = { "Green": "#2e7d32", "Amber": "#f9a825", "Amber-Red": "#e65100", "Red": "#c62828" };
   return map[band] || "#555";
 }
 
 // ============================================================
-// CHANGE G: 14-day trend graph (dependency-free inline SVG —
-// no charting library, so it works offline / on venue wifi)
+// Trend graph (inline SVG, dependency-free)
 // ============================================================
 function fmtDate(ts) {
   return new Date(ts).toLocaleDateString("en-GB", { day: "numeric", month: "short" });
@@ -1033,14 +1241,22 @@ function showExplanation(i) {
   document.getElementById("explainText").textContent  = step.text;
 }
 
-// Small helper for per-game cards: show absolute score plus
-// "vs your baseline" line once a baseline exists for that game.
-function baselineLineFor(perGame, key) {
-  const g = perGame?.[key];
+function baselineLineFor(perChannel, key) {
+  const g = perChannel?.[key];
   if (!g || g.personal === null) return "";
   const diff = g.abs - g.baseline;
   const sign = diff >= 0 ? "+" : "";
   return `<li>Vs your baseline: <b>${sign}${diff}</b> (usual ~${g.baseline})</li>`;
+}
+
+function pct(x) {
+  if (x === null || x === undefined || isNaN(x)) return "—";
+  return `${x >= 0 ? "+" : ""}${Math.round(x * 100)}%`;
+}
+
+function cvText(x) {
+  if (x === null || x === undefined || isNaN(x)) return "—";
+  return x.toFixed(2);
 }
 
 function contextPanelHTML(checkin, symptoms) {
@@ -1072,22 +1288,50 @@ function showResultsScreen() {
 
   const sdmt = GAME_RESULTS.sdmt, nback = GAME_RESULTS.nback, stroop = GAME_RESULTS.stroop, pvt = GAME_RESULTS.pvt;
 
-  // CHANGE A: score against the user's own prior 14 days.
+  // CHANGE K: compute stability, then score all five channels
+  // against the user's own prior 14 days.
+  const stability = computeStability(GAME_RESULTS);
   const priorHistory = getHistory(SESSION.aliasHash);
-  const scoring = computeSessionScore(GAME_RESULTS, priorHistory);
-  const { composite: overallScore, band, mode, perGame, delta } = scoring;
+  const scoring = computeSessionScore(GAME_RESULTS, stability, priorHistory);
+  const { composite: overallScore, band, mode, perChannel, delta, confidence } = scoring;
   const advice  = adviceFor(band, mode);
   const bColour = bandColour(band);
 
-  // Persist this session so future sessions can baseline against it.
+  // Persist this session for future baselines.
   saveSessionToHistory(SESSION.aliasHash, {
     ts: nowMs(),
-    sdmt:   sdmt?.score_0_100 ?? null,
-    nback:  nback?.score_0_100 ?? null,
-    stroop: stroop?.score_0_100 ?? null,
-    pvt:    pvt?.score_0_100 ?? null,
-    overall: overallScore,
+    sdmt:      sdmt?.score_0_100 ?? null,
+    nback:     nback?.score_0_100 ?? null,
+    stroop:    stroop?.score_0_100 ?? null,
+    pvt:       pvt?.score_0_100 ?? null,
+    stability: stability,
+    overall:   overallScore,
     band
+  });
+
+  // CHANGE N: full metric detail to the local research log.
+  appendMetricsLog(SESSION.aliasHash, {
+    session_id: SESSION.sessionId,
+    ts: nowMs(),
+    pvt: pvt ? {
+      median: pvt.median_rt_ms, sd: pvt.rt_sd, cv: pvt.rt_cv,
+      slow10: pvt.slow10_ms, fast10: pvt.fast10_ms,
+      decline: pvt.rt_decline, lapses: pvt.lapses,
+      false_starts: pvt.false_starts, timeouts: pvt.timeouts
+    } : null,
+    sdmt: sdmt ? {
+      median: sdmt.median_rt_ms, cv: sdmt.rt_cv,
+      decline: sdmt.throughput_decline, correct: sdmt.correct, incorrect: sdmt.incorrect
+    } : null,
+    stroop: stroop ? {
+      median: stroop.median_rt_ms, cv: stroop.rt_cv, decline: stroop.rt_decline
+    } : null,
+    nback: nback ? { decline: nback.accuracy_decline } : null,
+    stability,
+    overall: overallScore,
+    band,
+    mode,
+    checkin: SESSION.checkin
   });
 
   // Google Forms archive submission — unchanged pipeline.
@@ -1116,14 +1360,12 @@ function showResultsScreen() {
     [RESULTS_ENTRY.advice_text]:         advice
   });
 
-  // Calibration notice while baseline is still being established.
   const calibrationHTML = mode === "absolute"
     ? `<div style="background:#fff8e1;border:1px solid #ffe082;border-radius:8px;padding:12px 16px;margin-bottom:16px;font-size:14px;line-height:1.5;color:#6d4c00;">
         <b>Calibration notice:</b> Your first few sessions establish your personal baseline (${scoring.priorSessions} of ${BASELINE_MIN_SESSIONS} completed on this device). Once it's ready, your score will be compared against <i>your own</i> typical performance rather than a fixed scale.
       </div>`
     : "";
 
-  // Headline delta vs personal average (baseline mode only).
   let deltaHTML = "";
   if (mode === "baseline" && delta !== null) {
     const absD = Math.abs(delta);
@@ -1139,6 +1381,20 @@ function showResultsScreen() {
 
   const updatedHistory = getHistory(SESSION.aliasHash);
 
+  // CHANGE K: consistency card summarising variability + decline.
+  const stabilityCard = `
+    <div style="background:#f9f9f9;border-radius:10px;padding:14px;grid-column:1 / -1;">
+      <p style="margin:0 0 8px;font-weight:700;">Consistency <span style="font-weight:400;color:#777;font-size:13px;">(variability &amp; fade over each test)</span></p>
+      <ul style="margin:0;padding-left:18px;font-size:14px;line-height:1.8;">
+        <li>Stability index: <b>${stability ?? "—"} / 100</b></li>
+        <li>PVT — RT variability (CV): <b>${cvText(pvt?.rt_cv)}</b> · slowest 10%: <b>${pvt?.slow10_ms ?? "—"} ms</b> · 2nd-half slowdown: <b>${pct(pvt?.rt_decline)}</b></li>
+        <li>Stroop — RT variability (CV): <b>${cvText(stroop?.rt_cv)}</b> · 2nd-half slowdown: <b>${pct(stroop?.rt_decline)}</b></li>
+        <li>SDMT — RT variability (CV): <b>${cvText(sdmt?.rt_cv)}</b> · 2nd-half throughput drop: <b>${pct(sdmt?.throughput_decline)}</b></li>
+        <li>2-Back — 2nd-half accuracy drop: <b>${nback?.accuracy_decline !== null && nback?.accuracy_decline !== undefined ? pct(nback.accuracy_decline) : "—"}</b></li>
+        ${baselineLineFor(perChannel, "stability")}
+      </ul>
+    </div>`;
+
   document.getElementById("resultsSummary").innerHTML = `
     ${calibrationHTML}
     <div style="text-align:center;padding:16px 0 8px;">
@@ -1147,6 +1403,7 @@ function showResultsScreen() {
       ${deltaHTML}
       <p style="max-width:480px;margin:12px auto 0;font-size:15px;line-height:1.55;color:#333;">${advice}</p>
     </div>
+    ${confidenceNoteHTML(confidence)}
     ${modeLabel}
     ${contextPanelHTML(SESSION.checkin, SESSION.symptoms)}
     <hr style="margin:20px 0;border:none;border-top:1px solid #e0e0e0;" />
@@ -1157,7 +1414,7 @@ function showResultsScreen() {
           <li>Correct: <b>${sdmt ? sdmt.correct : "—"}</b></li>
           <li>Incorrect: <b>${sdmt ? sdmt.incorrect : "—"}</b></li>
           <li>Score: <b>${sdmt ? (sdmt.score_0_100 ?? "—") : "—"} / 100</b></li>
-          ${baselineLineFor(perGame, "sdmt")}
+          ${baselineLineFor(perChannel, "sdmt")}
         </ul>
       </div>
       <div style="background:#f9f9f9;border-radius:10px;padding:14px;">
@@ -1167,7 +1424,7 @@ function showResultsScreen() {
           <li>Misses: <b>${nback ? nback.misses : "—"}</b></li>
           <li>False alarms: <b>${nback ? nback.false_alarms : "—"}</b></li>
           <li>Score: <b>${nback ? (nback.score_0_100 ?? "—") : "—"} / 100</b></li>
-          ${baselineLineFor(perGame, "nback")}
+          ${baselineLineFor(perChannel, "nback")}
         </ul>
       </div>
       <div style="background:#f9f9f9;border-radius:10px;padding:14px;">
@@ -1177,7 +1434,7 @@ function showResultsScreen() {
           <li>Incorrect: <b>${stroop ? stroop.incorrect : "—"}</b></li>
           <li>Median RT: <b>${stroop ? stroop.median_rt_ms + " ms" : "—"}</b></li>
           <li>Score: <b>${stroop ? (stroop.score_0_100 ?? "—") : "—"} / 100</b></li>
-          ${baselineLineFor(perGame, "stroop")}
+          ${baselineLineFor(perChannel, "stroop")}
         </ul>
       </div>
       <div style="background:#f9f9f9;border-radius:10px;padding:14px;">
@@ -1187,9 +1444,10 @@ function showResultsScreen() {
           <li>Lapses: <b>${pvt ? pvt.lapses : "—"}</b></li>
           <li>False starts: <b>${pvt ? pvt.false_starts : "—"}</b></li>
           <li>Score: <b>${pvt ? (pvt.score_0_100 ?? "—") : "—"} / 100</b></li>
-          ${baselineLineFor(perGame, "pvt")}
+          ${baselineLineFor(perChannel, "pvt")}
         </ul>
       </div>
+      ${stabilityCard}
     </div>
     <hr style="margin:20px 0;border:none;border-top:1px solid #e0e0e0;" />
     <h3 style="margin:0 0 8px;">Your 14-day trend</h3>
@@ -1230,7 +1488,6 @@ async function main() {
     const aliasHash = await sha256Hex(salted);
     SESSION.alias = alias; SESSION.aliasHash = aliasHash;
 
-    // CHANGE H: demo mode — seed history, skip cooldown.
     if (isDemoMode()) {
       seedDemoHistory(aliasHash);
       hide("aliasSection"); show("checkinSection");
@@ -1305,8 +1562,6 @@ async function main() {
     };
 
     SESSION.symptoms = payload.checkin.symptoms;
-    // CHANGE B: check-in is kept on SESSION for DISPLAY as context —
-    // it is no longer fed into the score.
     SESSION.checkin  = payload.checkin;
 
     submitHiddenForm(FORM_CHECKIN_URL, {
@@ -1338,7 +1593,6 @@ async function main() {
 
   startBtn.addEventListener("click", () => { flowIndex = 0; showExplanation(flowIndex); });
 
-  // CHANGE G: trend view wiring.
   if (viewTrendBtn) viewTrendBtn.addEventListener("click", () => openTrendView("startSection"));
   if (trendBackBtn) trendBackBtn.addEventListener("click", () => {
     hide("trendSection"); show(lastSectionBeforeTrend);
