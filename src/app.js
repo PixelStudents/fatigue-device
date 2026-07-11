@@ -1,5 +1,47 @@
+// ============================================================
+// Riki Fatigue Check — app.js v0.3.0
+//
+// Major changes in this version:
+//   A. Personal baseline scoring (rolling 14-day, per-game,
+//      activates after 4+ sessions) via localStorage history.
+//      Score is now performance-relative-to-YOU, not a fixed
+//      universal scale.
+//   B. Context penalties REMOVED from scoring. Sleep / shift /
+//      symptoms / caffeine / self-rated fatigue are collected,
+//      submitted to Google Forms, and DISPLAYED as context on
+//      the results screen — but the score itself is driven by
+//      objective test performance only.
+//   C. Circadian multiplier removed (it unfairly penalised
+//      night-shift staff on every session).
+//   D. PVT fixed: lapse threshold back to literature-standard
+//      500 ms, inter-stimulus interval shortened to 1–4 s
+//      (PVT-B style → ~15-20 trials per minute instead of ~7),
+//      and a 3 s stimulus timeout so a full zone-out can't
+//      stall the test.
+//   E. 2-Back fixed: YES-only response design (no phantom NO
+//      button), missed-target bug at trial index 2 fixed,
+//      arbitrary score floor of 20 removed, scoring now uses
+//      hit rate minus false-alarm rate, 30 trials (~60 s).
+//   F. Stroop interference now measured the classic way: the
+//      REACTION-TIME gap between congruent and incongruent
+//      trials (accuracy is near ceiling for everyone, RT gap
+//      is the sensitive fatigue signal).
+//   G. 14-day trend graph (dependency-free inline SVG) on the
+//      results screen and via a "View my trend" button.
+//   H. Demo mode: add ?demo=1 to the URL to seed 12 realistic
+//      sessions of history for the entered alias (if it has
+//      fewer than 4 real sessions) and skip the cooldown —
+//      so judges can see baseline comparison + the trend graph
+//      working live from a single session.
+//
+// Google Forms submission is unchanged — it remains the
+// research/archive pipeline. localStorage is the read layer
+// that powers baselines and the graph (device-bound: history
+// lives on the device it was recorded on).
+// ============================================================
+
 // ===============================
-// FORM 1: CHECK-IN
+// FORM 1: CHECK-IN (unchanged)
 // ===============================
 const FORM_CHECKIN_URL =
   "https://docs.google.com/forms/d/e/1FAIpQLSfSO6_C_mIWA1G1OHuCwPIaOn_srffgsm6XmM8Y2SKKwhGyBA/formResponse";
@@ -23,7 +65,7 @@ const CHECKIN_ENTRY = {
 };
 
 // ===============================
-// FORM 2: GAME RESULTS
+// FORM 2: GAME RESULTS (unchanged)
 // ===============================
 const FORM_RESULTS_URL =
   "https://docs.google.com/forms/d/e/1FAIpQLSeL7efoV0n5cBJeJlM_sMfOufITpQcFirPkzAwC7-7uSmmoyA/formResponse";
@@ -60,18 +102,13 @@ async function loadConfig() {
   CONFIG = await res.json();
 }
 
-function show(id) {
-  const el = document.getElementById(id);
-  if (el) el.classList.remove("hidden");
-}
-function hide(id) {
-  const el = document.getElementById(id);
-  if (el) el.classList.add("hidden");
-}
+// ===============================
+// Generic helpers
+// ===============================
+function show(id) { const el = document.getElementById(id); if (el) el.classList.remove("hidden"); }
+function hide(id) { const el = document.getElementById(id); if (el) el.classList.add("hidden"); }
 
-function normalizeAlias(raw) {
-  return (raw || "").trim().toUpperCase();
-}
+function normalizeAlias(raw) { return (raw || "").trim().toUpperCase(); }
 
 function isValidAliasFormat(alias) {
   if (!alias || alias.length !== 4) return false;
@@ -110,11 +147,23 @@ function selectedSymptoms() {
   return Array.from(document.querySelectorAll(".symptom:checked")).map((x) => x.value);
 }
 
+function clamp01(x) { return Math.max(0, Math.min(1, x)); }
+function clamp0to100(x) { return Math.max(0, Math.min(100, x)); }
+
 function median(arr) {
   if (!arr || arr.length === 0) return 0;
   const sorted = [...arr].sort((a, b) => a - b);
   const mid = Math.floor(sorted.length / 2);
   return sorted.length % 2 !== 0 ? sorted[mid] : Math.round((sorted[mid - 1] + sorted[mid]) / 2);
+}
+
+// Median Absolute Deviation — robust spread estimate.
+// One bad/outlier session won't wreck the baseline the way
+// a mean/SD would with only ~10 data points.
+function mad(arr, center) {
+  if (!arr || arr.length === 0) return 0;
+  const deviations = arr.map((v) => Math.abs(v - center));
+  return median(deviations);
 }
 
 function getTodayKeyUTC() {
@@ -129,18 +178,6 @@ function getSessionCountToday(aliasHash) {
 function incrementSessionCountToday(aliasHash) {
   const key = `sessions_${aliasHash}_${getTodayKeyUTC()}`;
   const n = getSessionCountToday(aliasHash) + 1;
-  localStorage.setItem(key, String(n));
-  return n;
-}
-
-// CHANGE 5 (calibration notice): helpers to track total session count across all days
-function getTotalSessionCount(aliasHash) {
-  return Number(localStorage.getItem(`total_sessions_${aliasHash}`) || "0");
-}
-
-function incrementTotalSessionCount(aliasHash) {
-  const key = `total_sessions_${aliasHash}`;
-  const n = getTotalSessionCount(aliasHash) + 1;
   localStorage.setItem(key, String(n));
   return n;
 }
@@ -190,13 +227,94 @@ function submitHiddenForm(url, fields) {
   form.remove();
 }
 
-// SESSION now includes checkin for use in scoring (CHANGE 5 & 6)
+// ============================================================
+// CHANGE A: Session history store (the read layer)
+// ============================================================
+const HISTORY_WINDOW_DAYS = 14;
+const BASELINE_MIN_SESSIONS = 4;   // per game, before baseline scoring activates
+const DAY_MS = 86400000;
+
+function historyKey(aliasHash) { return `history_${aliasHash}`; }
+
+// Returns sessions from the last 14 days, oldest first.
+function getHistory(aliasHash) {
+  let raw;
+  try { raw = JSON.parse(localStorage.getItem(historyKey(aliasHash)) || "[]"); }
+  catch { raw = []; }
+  const cutoff = nowMs() - HISTORY_WINDOW_DAYS * DAY_MS;
+  return raw
+    .filter((h) => h && typeof h.ts === "number" && h.ts >= cutoff)
+    .sort((a, b) => a.ts - b.ts);
+}
+
+function saveSessionToHistory(aliasHash, entry) {
+  const hist = getHistory(aliasHash); // already trimmed to window
+  hist.push(entry);
+  localStorage.setItem(historyKey(aliasHash), JSON.stringify(hist));
+}
+
+// Per-game baseline stats from the user's own history.
+// Returns null until this game has BASELINE_MIN_SESSIONS data points.
+function baselineStatsFor(history, gameKey) {
+  const values = history
+    .map((h) => h[gameKey])
+    .filter((v) => typeof v === "number" && !isNaN(v));
+  if (values.length < BASELINE_MIN_SESSIONS) return null;
+  const center = median(values);
+  // Floor the spread at 5 points so a very consistent user's tiny
+  // variance doesn't turn a 3-point dip into an extreme z-score.
+  const sd = Math.max(mad(values, center) * 1.4826, 5);
+  return { center, sd, n: values.length };
+}
+
+// ============================================================
+// CHANGE H: Demo mode (?demo=1)
+// Seeds realistic history so judges can see baseline scoring
+// and the trend graph from a single live session.
+// ============================================================
+function isDemoMode() {
+  return new URLSearchParams(window.location.search).get("demo") === "1";
+}
+
+function seedDemoHistory(aliasHash) {
+  const existing = getHistory(aliasHash);
+  if (existing.length >= BASELINE_MIN_SESSIONS) return false;
+
+  const base = { pvt: 74, sdmt: 66, stroop: 72, nback: 62 };
+  const jitter = () => Math.round(Math.random() * 10 - 5);
+  const entries = [];
+  const now = nowMs();
+
+  for (let daysAgo = 13; daysAgo >= 1; daysAgo--) {
+    if (daysAgo === 8 || daysAgo === 3) continue; // realistic missed days
+    // A mild mid-window dip so the graph tells a story.
+    const dip = daysAgo >= 4 && daysAgo <= 6 ? -10 : 0;
+    const s = {
+      pvt:    clamp0to100(base.pvt + dip + jitter()),
+      sdmt:   clamp0to100(base.sdmt + dip + jitter()),
+      stroop: clamp0to100(base.stroop + dip + jitter()),
+      nback:  clamp0to100(base.nback + dip + jitter())
+    };
+    const overall = Math.round(s.pvt * 0.4 + s.sdmt * 0.2 + s.stroop * 0.2 + s.nback * 0.2);
+    entries.push({
+      ts: now - daysAgo * DAY_MS - Math.floor(Math.random() * 5) * 3600000,
+      ...s,
+      overall,
+      band: scoreToBandAbsolute(overall)
+    });
+  }
+  localStorage.setItem(historyKey(aliasHash), JSON.stringify(entries));
+  return true;
+}
+
+// ===============================
+// Session state
+// ===============================
 let SESSION = {
   alias: "",
   aliasHash: "",
   sessionId: "",
   sessionNumberToday: 0,
-  totalSessionNumber: 0, // CHANGE 5 (calibration notice): track total sessions
   isFirstToday: false,
   symptoms: [],
   checkin: {}
@@ -206,16 +324,17 @@ let GAME_RESULTS = { sdmt: null, nback: null, stroop: null, pvt: null };
 
 const FLOW = [
   { key: "sdmt",   title: "SDMT",   text: "A key at the top shows 9 symbols, each paired with a number. A symbol appears in the centre — press the matching number as fast as you can. You have 4 seconds per symbol before it counts as incorrect." },
-  { key: "nback",  title: "2-Back", text: "Letters appear one at a time. Press YES if the letter matches the one shown 2 steps ago, or NO if it doesn't. Stay focused — it gets tricky!" },
+  // CHANGE E: instructions now match the YES-only design.
+  { key: "nback",  title: "2-Back", text: "Letters appear one at a time. Press YES only when the letter matches the one shown 2 steps ago. If it doesn't match, don't press anything. Stay focused — it gets tricky!" },
   { key: "stroop", title: "Stroop", text: "A colour word will appear on screen printed in a different ink colour. Tap the button matching the INK COLOUR — ignore what the word says. Respond as quickly and accurately as you can. You have 60 seconds." },
-  { key: "pvt",    title: "PVT",    text: "A red dot will appear on screen after a random delay (2-10 seconds). Tap it as fast as you can. Do NOT tap before it appears — that counts as a false start. You have 60 seconds." }
+  // CHANGE D: delay text updated to 1–4 s.
+  { key: "pvt",    title: "PVT",    text: "A red dot will appear on screen after a short random delay (1-4 seconds). Tap it as fast as you can. Do NOT tap before it appears — that counts as a false start. You have 60 seconds." }
 ];
 
 let flowIndex = 0;
 
 // ===============================
-// SDMT Game
-// CHANGE 1: Updated piecewise curve for more even discrimination
+// SDMT Game — logic unchanged (v0.2.2 curve retained)
 // ===============================
 function runSDMT({ durationSec = 60, trialTimeoutSec = 4, onDone }) {
   const SYMBOLS = ["▭", "◯", "∧", "⊕", "≡", "⇔", "◄", "∴", "Ψ"];
@@ -336,9 +455,7 @@ function runSDMT({ durationSec = 60, trialTimeoutSec = 4, onDone }) {
     const attempts = correct + incorrect;
     let score = null;
     if (attempts >= 10) {
-      const clamp0to100 = (x) => Math.max(0, Math.min(100, x));
       const effective = correct - 0.25 * incorrect;
-      // CHANGE 1: Updated piecewise curve (v0.2.2 - softened lower ramp)
       let mappedScore = 0;
       if      (effective <= 10) { mappedScore = 0; }
       else if (effective <= 25) { mappedScore = 10 + ((effective - 10) / 15) * 50; }
@@ -351,9 +468,13 @@ function runSDMT({ durationSec = 60, trialTimeoutSec = 4, onDone }) {
 }
 
 // ===============================
-// 2-Back Game — unchanged
+// 2-Back Game
+// CHANGE E: YES-only design made explicit, missed-target bug at
+// the first scoreable trial fixed, score floor removed, scoring
+// now hit rate minus false-alarm rate, 30 trials (~60 s).
+// UI unchanged apart from the hint text.
 // ===============================
-function runNBack({ rounds = 25, nBack = 2, onDone }) {
+function runNBack({ rounds = 30, nBack = 2, onDone }) {
   const LETTERS = "BCDFGHJKLMNPQRSTVWXYZ".split("");
   const DISPLAY_MS = 500, ISI_MS = 2000;
 
@@ -366,7 +487,7 @@ function runNBack({ rounds = 25, nBack = 2, onDone }) {
 
   gameUI.innerHTML = `
     <div style="text-align:center;margin-top:20px;">
-      <p class="hint">Does this letter match the one from <b>2 steps ago</b>?</p>
+      <p class="hint">Press YES only when the letter matches the one from <b>2 steps ago</b>.</p>
       <div id="nbackStimulus" style="font-size:120px;font-weight:700;height:160px;line-height:160px;letter-spacing:2px;">&nbsp;</div>
       <div id="nbackFeedback" style="min-height:28px;font-size:16px;margin-top:8px;"></div>
       <div style="display:flex;justify-content:center;gap:24px;margin-top:20px;">
@@ -409,8 +530,10 @@ function runNBack({ rounds = 25, nBack = 2, onDone }) {
   function showFeedback(text, color) { feedbackEl.textContent = text; feedbackEl.style.color = color; }
 
   function recordNoResponse() {
-    if (trialIndex > nBack && !responded && isTarget) {
-      misses++; missesEl.textContent = String(misses); showFeedback("Miss!", "#c00");
+    // CHANGE E (bug fix): was `trialIndex > nBack`, which silently
+    // ignored a missed target on the FIRST scoreable trial (index 2).
+    if (trialIndex >= nBack && !responded && isTarget) {
+      misses++; missesEl.textContent = String(misses); showFeedback("✗ Miss", "#c00");
     }
   }
 
@@ -428,19 +551,17 @@ function runNBack({ rounds = 25, nBack = 2, onDone }) {
     isiTimer = setTimeout(() => { recordNoResponse(); trialIndex++; runTrial(); }, ISI_MS);
   }
 
-  function handleResponse(yes) {
+  function handleYes() {
     if (ended || trialIndex < nBack || responded) return;
     responded = true;
     clearTimeout(isiTimer);
-    if (yes && isTarget)       { hits++;        hitsEl.textContent   = String(hits);        showFeedback("✓ Hit!", "#080"); }
-    else if (yes && !isTarget) { falseAlarms++;  faEl.textContent     = String(falseAlarms); showFeedback("✗ False alarm", "#c00"); }
-    else if (!yes && isTarget) { misses++;       missesEl.textContent = String(misses);      showFeedback("✗ Miss", "#c00"); }
-    else                       { showFeedback("✓ Correct rejection", "#080"); }
+    if (isTarget) { hits++;       hitsEl.textContent = String(hits);        showFeedback("✓ Hit!", "#080"); }
+    else          { falseAlarms++; faEl.textContent   = String(falseAlarms); showFeedback("✗ False alarm", "#c00"); }
     isiTimer = setTimeout(() => { trialIndex++; runTrial(); }, 600);
   }
 
-  yesBtn.addEventListener("click", () => handleResponse(true));
-  function keyHandler(e) { if (e.key.toLowerCase() === "y") handleResponse(true);}
+  yesBtn.addEventListener("click", handleYes);
+  function keyHandler(e) { if (e.key.toLowerCase() === "y") handleYes(); }
   window.addEventListener("keydown", keyHandler);
 
   function finish() {
@@ -448,9 +569,17 @@ function runNBack({ rounds = 25, nBack = 2, onDone }) {
     clearTimeout(displayTimer); clearTimeout(isiTimer);
     window.removeEventListener("keydown", keyHandler);
     setButtons(false);
+
+    const scoreable = Math.max(0, rounds - nBack);
     const targetCount = sequence.filter((_, i) => i >= nBack && sequence[i] === sequence[i - nBack]).length;
-    const rawScore = targetCount > 0 ? (hits - falseAlarms) / targetCount : 0;
-    let score = Math.max(20, Math.min(100, Math.round(rawScore * 100)));
+    const nonTargetCount = Math.max(0, scoreable - targetCount);
+
+    // CHANGE E: hit rate minus false-alarm rate (simple d'-style
+    // discrimination measure). No-response-to-everything now
+    // scores 0, not an arbitrary 20.
+    const hitRate = targetCount > 0 ? hits / targetCount : 0;
+    const faRate  = nonTargetCount > 0 ? falseAlarms / nonTargetCount : 0;
+    let score = clamp0to100(Math.round((hitRate - faRate) * 100));
     if (rounds < 20) score = null;
     onDone?.({ hits, misses, false_alarms: falseAlarms, score_0_100: score });
   }
@@ -459,8 +588,10 @@ function runNBack({ rounds = 25, nBack = 2, onDone }) {
 
 // ===============================
 // Stroop Game
-// CHANGE 4: Interference effect — congruent/incongruent split tracked internally.
-// UI, timing, and trial generation completely unchanged.
+// CHANGE F: interference is now the classic RT-based measure —
+// the gap between median incongruent RT and median congruent RT.
+// Accuracy sits near ceiling for almost everyone, so the RT gap
+// is the sensitive fatigue signal. UI and trial generation unchanged.
 // ===============================
 function runStroop({ durationSec = 60, onDone }) {
   const COLOURS = [
@@ -500,10 +631,8 @@ function runStroop({ durationSec = 60, onDone }) {
 
   let correct = 0, incorrect = 0;
   const reactionTimes = [];
+  const congruentRTs = [], incongruentRTs = []; // CHANGE F
   let trialStart = 0, currentInkColour = "", currentIsCongruent = false, ended = false;
-
-  // CHANGE 4: separate congruent/incongruent counters
-  let congruentCorrect = 0, congruentIncorrect = 0, incongruentCorrect = 0, incongruentIncorrect = 0;
 
   function nextTrial() {
     const wordIdx = Math.floor(Math.random() * COLOURS.length);
@@ -511,7 +640,7 @@ function runStroop({ durationSec = 60, onDone }) {
     if (Math.random() < 0.6) { do { inkIdx = Math.floor(Math.random() * COLOURS.length); } while (inkIdx === wordIdx); }
     else { inkIdx = wordIdx; }
     currentInkColour   = COLOURS[inkIdx].name;
-    currentIsCongruent = (inkIdx === wordIdx); // CHANGE 4
+    currentIsCongruent = (inkIdx === wordIdx);
     wordEl.textContent = COLOURS[wordIdx].name;
     wordEl.style.color = COLOURS[inkIdx].hex;
     trialStart = Date.now();
@@ -532,14 +661,14 @@ function runStroop({ durationSec = 60, onDone }) {
     const rt = Date.now() - trialStart;
     if (chosen === currentInkColour) {
       correct++; reactionTimes.push(rt);
+      // CHANGE F: bank RTs per congruency (correct trials only)
+      if (currentIsCongruent) congruentRTs.push(rt); else incongruentRTs.push(rt);
       feedbackEl.textContent = "✓ Correct"; feedbackEl.style.color = "#080";
       correctEl.textContent = String(correct);
-      if (currentIsCongruent) { congruentCorrect++; } else { incongruentCorrect++; } // CHANGE 4
     } else {
       incorrect++;
       feedbackEl.textContent = `✗ Wrong — it was ${currentInkColour}`; feedbackEl.style.color = "#c00";
       incorrectEl.textContent = String(incorrect);
-      if (currentIsCongruent) { congruentIncorrect++; } else { incongruentIncorrect++; } // CHANGE 4
     }
     nextTrial();
     setTimeout(() => { if (!ended) feedbackEl.style.color = ""; }, 500);
@@ -557,17 +686,18 @@ function runStroop({ durationSec = 60, onDone }) {
     let score = null;
 
     if (total >= 10) {
-      const overallAccuracy = total > 0 ? correct / total : 0;
-      const congruentTotal   = congruentCorrect + congruentIncorrect;
-      const incongruentTotal = incongruentCorrect + incongruentIncorrect;
-      const congruentAcc   = congruentTotal   > 0 ? congruentCorrect   / congruentTotal   : overallAccuracy;
-      const incongruentAcc = incongruentTotal > 0 ? incongruentCorrect / incongruentTotal : overallAccuracy;
-      // CHANGE 4: interference effect = gap between congruent and incongruent accuracy
-      const interferenceEffect = Math.max(0, Math.min(1, congruentAcc - incongruentAcc));
-      const adjustedAccuracy   = (overallAccuracy * 0.6) + ((1 - interferenceEffect) * 0.4);
-      const speedScore = Math.max(0, Math.min(1, (1200 - medianRt) / 800));
-      const rawScore   = adjustedAccuracy * 0.7 + speedScore * 0.3;
-      score = Math.max(0, Math.min(100, Math.round(rawScore * 100)));
+      const accuracy = total > 0 ? correct / total : 0;
+      // CHANGE F: RT-based interference. Needs a few trials of
+      // each type to be meaningful; otherwise treated as 0.
+      let interferenceMs = 0;
+      if (congruentRTs.length >= 3 && incongruentRTs.length >= 3) {
+        interferenceMs = Math.max(0, median(incongruentRTs) - median(congruentRTs));
+      }
+      // 0–50 ms gap = normal, no penalty; 450 ms+ gap = maximum.
+      const interferenceNorm = clamp01((interferenceMs - 50) / 400);
+      const speedScore = clamp01((1200 - medianRt) / 800);
+      const rawScore = accuracy * 0.5 + speedScore * 0.3 + (1 - interferenceNorm) * 0.2;
+      score = clamp0to100(Math.round(rawScore * 100));
     }
     onDone?.({ correct, incorrect, median_rt_ms: medianRt, score_0_100: score });
   }
@@ -575,11 +705,19 @@ function runStroop({ durationSec = 60, onDone }) {
 
 // ===============================
 // PVT Game
-// CHANGE 3: Lapse threshold changed from 500ms to 450ms
+// CHANGE D:
+//   - Lapse threshold restored to the literature-standard 500 ms
+//     (450 ms + touchscreen input latency was flagging normal
+//     alert responses as lapses).
+//   - Inter-stimulus interval shortened to 1–4 s (PVT-B style),
+//     roughly tripling trials per minute — far less noisy median.
+//   - 3 s stimulus timeout: a complete zone-out (the exact person
+//     this device exists to catch) now counts as a lapse and the
+//     test moves on, instead of stalling for the rest of the minute.
 // ===============================
-function runPVT({ durationSec = 60, minDelaySec = 2, maxDelaySec = 10, onDone }) {
-  // CHANGE 3: reduced from 500ms to 450ms
-  const LAPSE_THRESHOLD_MS = 450;
+function runPVT({ durationSec = 60, minDelaySec = 1, maxDelaySec = 4, onDone }) {
+  const LAPSE_THRESHOLD_MS = 500;      // CHANGE D
+  const STIMULUS_TIMEOUT_MS = 3000;    // CHANGE D
 
   hide("explainSection"); show("gameSection");
   const gameTitle = document.getElementById("gameTitle");
@@ -595,7 +733,7 @@ function runPVT({ durationSec = 60, minDelaySec = 2, maxDelaySec = 10, onDone })
     <div id="pvtFeedback" style="text-align:center;min-height:28px;font-size:16px;margin-top:8px;"></div>
     <div class="hint" style="text-align:center;margin-top:12px;">
       Responses: <b id="pvtResponses">0</b> &nbsp;|&nbsp;
-      Lapses (&gt;450ms): <b id="pvtLapses">0</b> &nbsp;|&nbsp;
+      Lapses (&gt;500ms): <b id="pvtLapses">0</b> &nbsp;|&nbsp;
       False starts: <b id="pvtFalseStarts">0</b>
     </div>
     <div class="hint" style="text-align:center;margin-top:4px;">Last RT: <b id="pvtLastRT">—</b></div>`;
@@ -609,9 +747,10 @@ function runPVT({ durationSec = 60, minDelaySec = 2, maxDelaySec = 10, onDone })
   const lastRtEl      = document.getElementById("pvtLastRT");
 
   const reactionTimes = [];
-  let lapses = 0, falseStarts = 0, stimulusOn = false, stimulusStart = 0;
+  let lapses = 0, falseStarts = 0, timeouts = 0, stimulusOn = false, stimulusStart = 0;
   let waitHandle = null, ended = false, trials = 0;
-  let respondedThisTrial = false, currentTrialLapseCounted = false, lapseTimerHandle = null;
+  let respondedThisTrial = false, currentTrialLapseCounted = false;
+  let lapseTimerHandle = null, stimulusTimeoutHandle = null;
 
   const startMs = Date.now();
   function updateTimer() {
@@ -627,20 +766,30 @@ function runPVT({ durationSec = 60, minDelaySec = 2, maxDelaySec = 10, onDone })
     trials++; respondedThisTrial = false; currentTrialLapseCounted = false;
     stimulusOn = true; stimulusStart = Date.now();
     dot.style.background = "#e53935"; dot.style.opacity = "1"; dot.textContent = "";
-    clearTimeout(waitHandle); clearTimeout(lapseTimerHandle);
-    // CHANGE 3: uses updated LAPSE_THRESHOLD_MS (450ms)
+    clearTimeout(waitHandle); clearTimeout(lapseTimerHandle); clearTimeout(stimulusTimeoutHandle);
+
     lapseTimerHandle = setTimeout(() => {
       if (ended) return;
       if (stimulusOn && !respondedThisTrial && !currentTrialLapseCounted) {
         lapses++; currentTrialLapseCounted = true; lapsesEl.textContent = String(lapses);
       }
     }, LAPSE_THRESHOLD_MS);
+
+    // CHANGE D: full non-response — count it, move on.
+    stimulusTimeoutHandle = setTimeout(() => {
+      if (ended || !stimulusOn || respondedThisTrial) return;
+      timeouts++;
+      if (!currentTrialLapseCounted) { lapses++; currentTrialLapseCounted = true; lapsesEl.textContent = String(lapses); }
+      feedbackEl.textContent = "✗ No response"; feedbackEl.style.color = "#c00";
+      hideStimulus(); scheduleNext();
+      setTimeout(() => { if (!ended) feedbackEl.style.color = ""; }, 700);
+    }, STIMULUS_TIMEOUT_MS);
   }
 
   function hideStimulus() {
     stimulusOn = false;
     dot.style.background = "#ccc"; dot.style.opacity = "0.25"; dot.textContent = "";
-    clearTimeout(waitHandle); clearTimeout(lapseTimerHandle);
+    clearTimeout(waitHandle); clearTimeout(lapseTimerHandle); clearTimeout(stimulusTimeoutHandle);
   }
 
   function scheduleNext() {
@@ -657,12 +806,11 @@ function runPVT({ durationSec = 60, minDelaySec = 2, maxDelaySec = 10, onDone })
       return;
     }
     respondedThisTrial = true;
-    clearTimeout(lapseTimerHandle);
+    clearTimeout(lapseTimerHandle); clearTimeout(stimulusTimeoutHandle);
     const rt = Date.now() - stimulusStart;
     reactionTimes.push(rt);
     responsesEl.textContent = String(reactionTimes.length);
     lastRtEl.textContent = rt + " ms";
-    // CHANGE 3: threshold check uses updated LAPSE_THRESHOLD_MS (450ms)
     if (rt >= LAPSE_THRESHOLD_MS) {
       if (!currentTrialLapseCounted) { lapses++; currentTrialLapseCounted = true; lapsesEl.textContent = String(lapses); }
       feedbackEl.textContent = `⚠ Slow: ${rt} ms (lapse)`; feedbackEl.style.color = "#c00";
@@ -677,10 +825,9 @@ function runPVT({ durationSec = 60, minDelaySec = 2, maxDelaySec = 10, onDone })
 
   function finish() {
     ended = true;
-    clearInterval(timerInt); clearTimeout(waitHandle); clearTimeout(lapseTimerHandle);
+    clearInterval(timerInt); clearTimeout(waitHandle);
+    clearTimeout(lapseTimerHandle); clearTimeout(stimulusTimeoutHandle);
     hideStimulus();
-    const clamp01 = (x) => Math.max(0, Math.min(1, x));
-    const clamp0to100 = (x) => Math.max(0, Math.min(100, x));
     const medianRt   = median(reactionTimes);
     const lapseRate  = trials > 0 ? lapses / trials : 0;
     const fsRate     = trials > 0 ? falseStarts / trials : 0;
@@ -689,94 +836,191 @@ function runPVT({ durationSec = 60, minDelaySec = 2, maxDelaySec = 10, onDone })
     const fsPenalty    = clamp01(fsRate * 0.4);
     const rawScore     = speedScore * (1 - clamp01(lapsePenalty + fsPenalty));
     let score = clamp0to100(Math.round(rawScore * 100));
-    if (trials < 8) score = null;
-    onDone?.({ median_rt_ms: medianRt, lapses, false_starts: falseStarts, score_0_100: score });
+    // Need a sensible number of trials AND actual responses for a valid median.
+    if (trials < 8 || reactionTimes.length < 5) score = null;
+    onDone?.({ median_rt_ms: medianRt, lapses, false_starts: falseStarts, timeouts, score_0_100: score });
   }
 }
 
-// ===============================
-// Scoring helpers
-// ===============================
-function symptomPenalty(symptoms) {
-  const weights = {
-    drowsy: 3, brain_fog: 3, microsleeps: 3, slower_thinking: 3, clumsy_coordination: 3,
-    yawning: 2, heavy_eyelids: 2, reduced_motivation: 2, irritable: 2,
-    headache: 1, dizziness: 1, stress: 1, low_mood: 1
-  };
-  const total = (symptoms || []).reduce((sum, s) => sum + (weights[s] || 0), 0);
-  return Math.max(0, Math.min(12, total));
-}
+// ============================================================
+// CHANGES A, B, C: Scoring
+//
+// The score is now driven purely by objective test performance.
+// Once a game has 4+ sessions of history, today's raw game score
+// is converted to a PERSONAL score:
+//
+//     z = (today − your 14-day median) / your robust SD
+//     personal = 75 + z × 12        (75 = "your normal")
+//
+// The composite is the weighted average of personal scores
+// (falling back to the raw score for games without a baseline
+// yet). Banding is deviation-based in baseline mode:
+//
+//     ≥ 69  Green      (within ~0.5 SD of your normal)
+//     ≥ 57  Amber      (0.5–1.5 SD below)
+//     ≥ 45  Amber-Red  (1.5–2.5 SD below)
+//     < 45  Red        (> 2.5 SD below)
+//
+// Sleep / shift / symptoms are no longer subtracted — they are
+// shown as context alongside the score. The circadian multiplier
+// is gone: a 3 am session is now compared against your own
+// history, not handicapped by a blanket night-time haircut.
+// ============================================================
+const GAME_WEIGHTS = { pvt: 0.40, sdmt: 0.20, stroop: 0.20, nback: 0.20 };
 
-// CHANGE 5: Sleep hours penalty
-function sleepHoursPenalty(sleepHours) {
-  if (sleepHours === null || sleepHours === undefined || isNaN(sleepHours)) return 0;
-  if (sleepHours >= 7 && sleepHours <= 9) return 0;
-  if (sleepHours > 9)  return 2;
-  if (sleepHours >= 6) return 3;
-  if (sleepHours >= 5) return 6;
-  return 10;
-}
-
-// CHANGE 6: Shift hours penalty
-function shiftHoursPenalty(hoursIntoShift) {
-  if (hoursIntoShift === null || hoursIntoShift === undefined || isNaN(hoursIntoShift)) return 0;
-  if (hoursIntoShift < 6)  return 0;
-  if (hoursIntoShift < 8)  return 2;
-  if (hoursIntoShift < 10) return 5;
-  if (hoursIntoShift < 12) return 8;
-  return 12;
-}
-
-// CHANGE 7: Circadian multiplier
-function circadianMultiplier() {
-  const hour = new Date().getHours();
-  if (hour >= 0  && hour < 6)  return 0.92;
-  if (hour >= 18 && hour < 24) return 0.96;
-  return 1.00;
-}
-
-// CHANGE 2, 5, 6, 7: computeOverall — updated weights and full penalty pipeline
-function computeOverall(results, checkinData) {
-  // CHANGE 2: Updated weights
-  const weights = { pvt: 0.35, sdmt: 0.20, stroop: 0.25, nback: 0.20 };
-  let total = 0, wSum = 0;
-  for (const [key, w] of Object.entries(weights)) {
-    const r = results[key];
-    if (r && typeof r.score_0_100 === "number") { total += r.score_0_100 * w; wSum += w; }
-  }
-  // Step 1: weighted game average
-  let overallScoreRaw = wSum > 0 ? Math.round(total / wSum) : 0;
-  // Step 2 — CHANGE 7: circadian multiplier
-  overallScoreRaw = Math.round(overallScoreRaw * circadianMultiplier());
-  // Steps 3 & 4 — CHANGE 5 & 6: context penalties
-  const sleepPenalty = sleepHoursPenalty(checkinData?.sleep_hours);
-  const shiftPenalty = shiftHoursPenalty(checkinData?.hours_into_shift);
-  // Step 5: cap combined context penalty at 18
-  const combinedContextPenalty = Math.min(sleepPenalty + shiftPenalty, 18);
-  // Step 6: symptom penalty — unchanged
-  const symPenalty = symptomPenalty(SESSION.symptoms);
-  // Step 7 & 8: final score
-  const totalPenalty = combinedContextPenalty + symPenalty;
-  return Math.max(0, Math.min(100, overallScoreRaw - totalPenalty));
-}
-
-function scoreToBand(score) {
+function scoreToBandAbsolute(score) {
   if (score >= 75) return "Green";
   if (score >= 60) return "Amber";
   if (score >= 40) return "Amber-Red";
   return "Red";
 }
 
-function scoreToAdvice(score, band) {
-  if (band === "Green")     return "Cognitive performance looks good. You appear alert and well-rested. Continue as normal and recheck after your next rest break.";
-  if (band === "Amber")     return "Mild signs of fatigue detected. Take a short break if possible, stay hydrated, and avoid high-risk tasks requiring sustained focus. Recheck in 2 hours.";
-  if (band === "Amber-Red") return "Moderate fatigue indicators present. Consider a rest or handover before safety-critical tasks. Do not drive or operate machinery without supervisor awareness.";
-  return "Significant fatigue detected. Rest is strongly recommended before resuming duty. Inform your supervisor and avoid safety-critical tasks.";
+function scoreToBandBaseline(score) {
+  if (score >= 69) return "Green";
+  if (score >= 57) return "Amber";
+  if (score >= 45) return "Amber-Red";
+  return "Red";
+}
+
+function computeSessionScore(results, history) {
+  const perGame = {};
+  let total = 0, wSum = 0, baselineGamesUsed = 0;
+
+  for (const [key, w] of Object.entries(GAME_WEIGHTS)) {
+    const r = results[key];
+    if (!r || typeof r.score_0_100 !== "number") continue;
+    const abs = r.score_0_100;
+    const stats = baselineStatsFor(history, key);
+    let effective = abs, z = null, personal = null;
+    if (stats) {
+      z = (abs - stats.center) / stats.sd;
+      personal = clamp0to100(Math.round(75 + z * 12));
+      effective = personal;
+      baselineGamesUsed++;
+    }
+    perGame[key] = { abs, personal, z, baseline: stats ? stats.center : null };
+    total += effective * w;
+    wSum += w;
+  }
+
+  const composite = wSum > 0 ? Math.round(total / wSum) : 0;
+  const mode = baselineGamesUsed >= 3 ? "baseline" : "absolute";
+  const band = mode === "baseline" ? scoreToBandBaseline(composite) : scoreToBandAbsolute(composite);
+
+  // Delta vs the user's recent overall average (for the headline
+  // "N points below your 2-week average" line).
+  const priorOveralls = history
+    .map((h) => h.overall)
+    .filter((v) => typeof v === "number" && !isNaN(v));
+  let delta = null;
+  if (priorOveralls.length >= BASELINE_MIN_SESSIONS) {
+    const avg = Math.round(priorOveralls.reduce((a, b) => a + b, 0) / priorOveralls.length);
+    delta = composite - avg;
+  }
+
+  return { composite, band, mode, baselineGamesUsed, perGame, delta, priorSessions: history.length };
+}
+
+// CHANGE B: advice softened to wellness-companion register —
+// the device helps you notice changes, it doesn't issue orders.
+function adviceFor(band, mode) {
+  if (mode === "baseline") {
+    if (band === "Green")     return "You're performing at or around your usual level. No unusual signs of fatigue in today's results — recheck after your next break if you'd like to keep tracking.";
+    if (band === "Amber")     return "Your performance is a little below your recent average. You may benefit from a short break and some water before tasks needing sustained focus. Consider rechecking in a couple of hours.";
+    if (band === "Amber-Red") return "Your performance is noticeably below your recent average. Consider taking a proper rest break before demanding tasks, and keep an eye on how you're feeling.";
+    return "Your performance is well below your recent average. Rest is recommended when you're able, and you may wish to recheck after a break before taking on demanding tasks.";
+  }
+  if (band === "Green")     return "Cognitive performance looks good today. Recheck after your next rest break to keep building your personal baseline.";
+  if (band === "Amber")     return "Mild signs of reduced performance. A short break and some water may help — consider rechecking in a couple of hours.";
+  if (band === "Amber-Red") return "Moderate signs of reduced performance. Consider a proper rest before tasks that need sustained focus.";
+  return "Significant signs of reduced performance. Rest is recommended when you're able, and consider rechecking after a break.";
 }
 
 function bandColour(band) {
   const map = { "Green": "#2e7d32", "Amber": "#f9a825", "Amber-Red": "#e65100", "Red": "#c62828" };
   return map[band] || "#555";
+}
+
+// ============================================================
+// CHANGE G: 14-day trend graph (dependency-free inline SVG —
+// no charting library, so it works offline / on venue wifi)
+// ============================================================
+function fmtDate(ts) {
+  return new Date(ts).toLocaleDateString("en-GB", { day: "numeric", month: "short" });
+}
+
+function renderTrendSVG(history) {
+  const entries = [...history].sort((a, b) => a.ts - b.ts);
+  if (entries.length < 2) {
+    return `<p class="hint" style="text-align:center;padding:16px 0;">Complete at least 2 sessions on this device to see your trend over time.</p>`;
+  }
+
+  const W = 640, H = 260, padL = 36, padR = 14, padT = 16, padB = 32;
+  const minTs = entries[0].ts, maxTs = entries[entries.length - 1].ts;
+  const span = Math.max(maxTs - minTs, 1);
+  const x = (ts) => padL + ((ts - minTs) / span) * (W - padL - padR);
+  const y = (s) => padT + (1 - s / 100) * (H - padT - padB);
+
+  const gridLines = [0, 25, 50, 75, 100].map((v) => `
+    <line x1="${padL}" y1="${y(v)}" x2="${W - padR}" y2="${y(v)}" stroke="#eee" stroke-width="1"/>
+    <text x="${padL - 8}" y="${y(v) + 4}" text-anchor="end" font-size="11" fill="#999">${v}</text>`).join("");
+
+  const linePath = entries
+    .map((e, i) => `${i === 0 ? "M" : "L"} ${x(e.ts).toFixed(1)} ${y(e.overall).toFixed(1)}`)
+    .join(" ");
+
+  const overalls = entries.map((e) => e.overall);
+  const avg = median(overalls);
+  const avgLine = entries.length >= BASELINE_MIN_SESSIONS ? `
+    <line x1="${padL}" y1="${y(avg)}" x2="${W - padR}" y2="${y(avg)}" stroke="#888" stroke-width="1.5" stroke-dasharray="6 5"/>
+    <text x="${W - padR}" y="${y(avg) - 6}" text-anchor="end" font-size="11" fill="#666">14-day average (${avg})</text>` : "";
+
+  const dots = entries.map((e) => `
+    <circle cx="${x(e.ts).toFixed(1)}" cy="${y(e.overall).toFixed(1)}" r="5"
+      fill="${bandColour(e.band)}" stroke="#fff" stroke-width="1.5">
+      <title>${fmtDate(e.ts)} — ${e.overall} (${e.band})</title>
+    </circle>`).join("");
+
+  const midTs = entries[Math.floor(entries.length / 2)].ts;
+  const dateLabels = `
+    <text x="${x(minTs)}" y="${H - 10}" text-anchor="start" font-size="11" fill="#999">${fmtDate(minTs)}</text>
+    ${entries.length > 3 ? `<text x="${x(midTs)}" y="${H - 10}" text-anchor="middle" font-size="11" fill="#999">${fmtDate(midTs)}</text>` : ""}
+    <text x="${x(maxTs)}" y="${H - 10}" text-anchor="end" font-size="11" fill="#999">${fmtDate(maxTs)}</text>`;
+
+  return `
+    <svg viewBox="0 0 ${W} ${H}" style="width:100%;height:auto;display:block;" role="img" aria-label="Overall score over the last 14 days">
+      ${gridLines}
+      ${avgLine}
+      <path d="${linePath}" fill="none" stroke="#1a73e8" stroke-width="2" stroke-linejoin="round"/>
+      ${dots}
+      ${dateLabels}
+    </svg>
+    <p class="hint" style="text-align:center;margin-top:6px;">
+      Dot colour shows the band for each session${entries.length >= BASELINE_MIN_SESSIONS ? " · dashed line is your 14-day average" : ""}.
+    </p>`;
+}
+
+function renderTrendSummary(history) {
+  if (!history.length) return "";
+  const overalls = history.map((h) => h.overall).filter((v) => typeof v === "number");
+  if (!overalls.length) return "";
+  const avg = Math.round(overalls.reduce((a, b) => a + b, 0) / overalls.length);
+  const best = Math.max(...overalls);
+  return `<p class="hint" style="text-align:center;margin-top:4px;">
+    ${history.length} session${history.length === 1 ? "" : "s"} in the last 14 days · average ${avg} · best ${best}
+  </p>`;
+}
+
+let lastSectionBeforeTrend = "aliasSection";
+
+function openTrendView(fromSectionId) {
+  if (!SESSION.aliasHash) return;
+  lastSectionBeforeTrend = fromSectionId;
+  const history = getHistory(SESSION.aliasHash);
+  document.getElementById("trendContent").innerHTML =
+    renderTrendSVG(history) + renderTrendSummary(history);
+  hide(fromSectionId);
+  show("trendSection");
 }
 
 // ===============================
@@ -789,17 +1033,64 @@ function showExplanation(i) {
   document.getElementById("explainText").textContent  = step.text;
 }
 
+// Small helper for per-game cards: show absolute score plus
+// "vs your baseline" line once a baseline exists for that game.
+function baselineLineFor(perGame, key) {
+  const g = perGame?.[key];
+  if (!g || g.personal === null) return "";
+  const diff = g.abs - g.baseline;
+  const sign = diff >= 0 ? "+" : "";
+  return `<li>Vs your baseline: <b>${sign}${diff}</b> (usual ~${g.baseline})</li>`;
+}
+
+function contextPanelHTML(checkin, symptoms) {
+  const bits = [];
+  if (typeof checkin?.sleep_hours === "number") {
+    bits.push(`${checkin.sleep_hours}h sleep${checkin.broken_sleep === "yes" ? " (broken)" : ""}`);
+  }
+  if (typeof checkin?.hours_into_shift === "number" && typeof checkin?.shift_length_hours === "number") {
+    bits.push(`${checkin.hours_into_shift}h into a ${checkin.shift_length_hours}h shift`);
+  } else if (typeof checkin?.hours_into_shift === "number") {
+    bits.push(`${checkin.hours_into_shift}h into your shift`);
+  }
+  if (checkin?.caffeine_level) bits.push(`caffeine: ${checkin.caffeine_level}`);
+  if (typeof checkin?.fatigue_scale === "number") bits.push(`self-rated fatigue ${checkin.fatigue_scale}/10`);
+  const symptomText = (symptoms || []).length
+    ? `Symptoms reported: ${symptoms.join(", ").replace(/_/g, " ")}.`
+    : "";
+  if (!bits.length && !symptomText) return "";
+  return `
+    <div style="background:#f5f7fa;border:1px solid #e0e5ec;border-radius:8px;padding:12px 16px;margin-top:16px;font-size:14px;line-height:1.5;color:#444;">
+      <b>Context you reported:</b> ${bits.join(" · ")}.
+      ${symptomText}
+      <span style="display:block;margin-top:4px;color:#777;">Your score is based on test performance only — this context is shown alongside it, not subtracted from it.</span>
+    </div>`;
+}
+
 function showResultsScreen() {
   hide("gameSection"); hide("explainSection"); hide("startSection"); show("resultsSection");
 
   const sdmt = GAME_RESULTS.sdmt, nback = GAME_RESULTS.nback, stroop = GAME_RESULTS.stroop, pvt = GAME_RESULTS.pvt;
 
-  // CHANGE 5 & 6: pass SESSION.checkin so sleep/shift penalties are applied
-  const overallScore = computeOverall(GAME_RESULTS, SESSION.checkin);
-  const band    = scoreToBand(overallScore);
-  const advice  = scoreToAdvice(overallScore, band);
+  // CHANGE A: score against the user's own prior 14 days.
+  const priorHistory = getHistory(SESSION.aliasHash);
+  const scoring = computeSessionScore(GAME_RESULTS, priorHistory);
+  const { composite: overallScore, band, mode, perGame, delta } = scoring;
+  const advice  = adviceFor(band, mode);
   const bColour = bandColour(band);
 
+  // Persist this session so future sessions can baseline against it.
+  saveSessionToHistory(SESSION.aliasHash, {
+    ts: nowMs(),
+    sdmt:   sdmt?.score_0_100 ?? null,
+    nback:  nback?.score_0_100 ?? null,
+    stroop: stroop?.score_0_100 ?? null,
+    pvt:    pvt?.score_0_100 ?? null,
+    overall: overallScore,
+    band
+  });
+
+  // Google Forms archive submission — unchanged pipeline.
   submitHiddenForm(FORM_RESULTS_URL, {
     [RESULTS_ENTRY.timestamp_utc]:       new Date().toISOString(),
     [RESULTS_ENTRY.session_id]:          SESSION.sessionId,
@@ -825,20 +1116,39 @@ function showResultsScreen() {
     [RESULTS_ENTRY.advice_text]:         advice
   });
 
-  // CHANGE 5 (calibration notice): show notice if fewer than 4 total sessions
-  const calibrationHTML = SESSION.totalSessionNumber < 4
+  // Calibration notice while baseline is still being established.
+  const calibrationHTML = mode === "absolute"
     ? `<div style="background:#fff8e1;border:1px solid #ffe082;border-radius:8px;padding:12px 16px;margin-bottom:16px;font-size:14px;line-height:1.5;color:#6d4c00;">
-        <b>Calibration notice:</b> Your first few sessions help establish your personal baseline. Scores during this period may not yet fully reflect your typical performance as you become familiar with the tasks.
+        <b>Calibration notice:</b> Your first few sessions establish your personal baseline (${scoring.priorSessions} of ${BASELINE_MIN_SESSIONS} completed on this device). Once it's ready, your score will be compared against <i>your own</i> typical performance rather than a fixed scale.
       </div>`
     : "";
+
+  // Headline delta vs personal average (baseline mode only).
+  let deltaHTML = "";
+  if (mode === "baseline" && delta !== null) {
+    const absD = Math.abs(delta);
+    const deltaText = delta > 2 ? `${absD} points above your 2-week average`
+                    : delta < -2 ? `${absD} points below your 2-week average`
+                    : "in line with your 2-week average";
+    deltaHTML = `<div style="font-size:15px;color:#555;margin-top:6px;">${deltaText}</div>`;
+  }
+
+  const modeLabel = mode === "baseline"
+    ? `<p class="hint" style="text-align:center;margin-top:8px;">Scored against your personal baseline (last 14 days on this device).</p>`
+    : "";
+
+  const updatedHistory = getHistory(SESSION.aliasHash);
 
   document.getElementById("resultsSummary").innerHTML = `
     ${calibrationHTML}
     <div style="text-align:center;padding:16px 0 8px;">
       <div style="font-size:64px;font-weight:900;color:${bColour};">${overallScore}</div>
       <div style="font-size:22px;font-weight:700;color:${bColour};margin-top:4px;">${band}</div>
+      ${deltaHTML}
       <p style="max-width:480px;margin:12px auto 0;font-size:15px;line-height:1.55;color:#333;">${advice}</p>
     </div>
+    ${modeLabel}
+    ${contextPanelHTML(SESSION.checkin, SESSION.symptoms)}
     <hr style="margin:20px 0;border:none;border-top:1px solid #e0e0e0;" />
     <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;">
       <div style="background:#f9f9f9;border-radius:10px;padding:14px;">
@@ -846,7 +1156,8 @@ function showResultsScreen() {
         <ul style="margin:0;padding-left:18px;font-size:14px;line-height:1.8;">
           <li>Correct: <b>${sdmt ? sdmt.correct : "—"}</b></li>
           <li>Incorrect: <b>${sdmt ? sdmt.incorrect : "—"}</b></li>
-          <li>Score: <b>${sdmt ? sdmt.score_0_100 : "—"} / 100</b></li>
+          <li>Score: <b>${sdmt ? (sdmt.score_0_100 ?? "—") : "—"} / 100</b></li>
+          ${baselineLineFor(perGame, "sdmt")}
         </ul>
       </div>
       <div style="background:#f9f9f9;border-radius:10px;padding:14px;">
@@ -855,7 +1166,8 @@ function showResultsScreen() {
           <li>Hits: <b>${nback ? nback.hits : "—"}</b></li>
           <li>Misses: <b>${nback ? nback.misses : "—"}</b></li>
           <li>False alarms: <b>${nback ? nback.false_alarms : "—"}</b></li>
-          <li>Score: <b>${nback ? nback.score_0_100 : "—"} / 100</b></li>
+          <li>Score: <b>${nback ? (nback.score_0_100 ?? "—") : "—"} / 100</b></li>
+          ${baselineLineFor(perGame, "nback")}
         </ul>
       </div>
       <div style="background:#f9f9f9;border-radius:10px;padding:14px;">
@@ -864,7 +1176,8 @@ function showResultsScreen() {
           <li>Correct: <b>${stroop ? stroop.correct : "—"}</b></li>
           <li>Incorrect: <b>${stroop ? stroop.incorrect : "—"}</b></li>
           <li>Median RT: <b>${stroop ? stroop.median_rt_ms + " ms" : "—"}</b></li>
-          <li>Score: <b>${stroop ? stroop.score_0_100 : "—"} / 100</b></li>
+          <li>Score: <b>${stroop ? (stroop.score_0_100 ?? "—") : "—"} / 100</b></li>
+          ${baselineLineFor(perGame, "stroop")}
         </ul>
       </div>
       <div style="background:#f9f9f9;border-radius:10px;padding:14px;">
@@ -873,12 +1186,17 @@ function showResultsScreen() {
           <li>Median RT: <b>${pvt ? pvt.median_rt_ms + " ms" : "—"}</b></li>
           <li>Lapses: <b>${pvt ? pvt.lapses : "—"}</b></li>
           <li>False starts: <b>${pvt ? pvt.false_starts : "—"}</b></li>
-          <li>Score: <b>${pvt ? pvt.score_0_100 : "—"} / 100</b></li>
+          <li>Score: <b>${pvt ? (pvt.score_0_100 ?? "—") : "—"} / 100</b></li>
+          ${baselineLineFor(perGame, "pvt")}
         </ul>
       </div>
     </div>
+    <hr style="margin:20px 0;border:none;border-top:1px solid #e0e0e0;" />
+    <h3 style="margin:0 0 8px;">Your 14-day trend</h3>
+    ${renderTrendSVG(updatedHistory)}
+    ${renderTrendSummary(updatedHistory)}
     <p class="hint" style="text-align:center;margin-top:16px;">
-      Results submitted to Google Sheets. &nbsp; Session ID: ${SESSION.sessionId}
+      Results submitted. &nbsp; Session ID: ${SESSION.sessionId}
     </p>`;
 }
 
@@ -899,6 +1217,8 @@ async function main() {
   const startBtn     = document.getElementById("startSessionBtn");
   const beginTestBtn = document.getElementById("beginTestBtn");
   const finishBtn    = document.getElementById("finishBtn");
+  const viewTrendBtn = document.getElementById("viewTrendBtn");
+  const trendBackBtn = document.getElementById("trendBackBtn");
 
   aliasBtn.addEventListener("click", async () => {
     aliasError.textContent = "";
@@ -909,6 +1229,13 @@ async function main() {
     const salted = `${CONFIG.HASHING.salt}::${alias}`;
     const aliasHash = await sha256Hex(salted);
     SESSION.alias = alias; SESSION.aliasHash = aliasHash;
+
+    // CHANGE H: demo mode — seed history, skip cooldown.
+    if (isDemoMode()) {
+      seedDemoHistory(aliasHash);
+      hide("aliasSection"); show("checkinSection");
+      return;
+    }
 
     const cachedAge = getCachedAge(aliasHash);
     if (cachedAge) document.getElementById("age").value = cachedAge;
@@ -945,7 +1272,6 @@ async function main() {
     const motivation_scale   = Number(document.getElementById("motivation").value || "");
     const age                = Number(document.getElementById("age").value        || "");
 
-    // NEW FIELDS: gender and broken sleep
     const gender             = document.getElementById("gender").value || "";
     const brokenSleepEl      = document.querySelector('input[name="brokenSleep"]:checked');
     const broken_sleep       = brokenSleepEl ? brokenSleepEl.value : "";
@@ -955,8 +1281,6 @@ async function main() {
     SESSION.sessionId          = uuidv4();
     SESSION.sessionNumberToday = incrementSessionCountToday(SESSION.aliasHash);
     SESSION.isFirstToday       = SESSION.sessionNumberToday === 1;
-    // CHANGE 5 (calibration notice): increment and store total session count
-    SESSION.totalSessionNumber = incrementTotalSessionCount(SESSION.aliasHash);
 
     const payload = {
       timestamp_utc: new Date().toISOString(),
@@ -981,10 +1305,9 @@ async function main() {
     };
 
     SESSION.symptoms = payload.checkin.symptoms;
-    // CHANGE 5 & 6: store checkin on SESSION so computeOverall can access sleep/shift data
+    // CHANGE B: check-in is kept on SESSION for DISPLAY as context —
+    // it is no longer fed into the score.
     SESSION.checkin  = payload.checkin;
-
-    localStorage.setItem(`session_${payload.session_id}`, JSON.stringify(payload));
 
     submitHiddenForm(FORM_CHECKIN_URL, {
       [CHECKIN_ENTRY.timestamp_utc]:          payload.timestamp_utc,
@@ -1004,7 +1327,9 @@ async function main() {
       [CHECKIN_ENTRY.age]:                    String(payload.checkin.age ?? "")
     });
 
-    setCooldownUntilMs(SESSION.aliasHash, nowMs() + CONFIG.COOLDOWN_HOURS * 3600 * 1000);
+    if (!isDemoMode()) {
+      setCooldownUntilMs(SESSION.aliasHash, nowMs() + CONFIG.COOLDOWN_HOURS * 3600 * 1000);
+    }
     GAME_RESULTS = { sdmt: null, nback: null, stroop: null, pvt: null };
     submitMsg.textContent = "Saved. Continuing to tests…";
     submitBtn.disabled = false;
@@ -1012,6 +1337,12 @@ async function main() {
   });
 
   startBtn.addEventListener("click", () => { flowIndex = 0; showExplanation(flowIndex); });
+
+  // CHANGE G: trend view wiring.
+  if (viewTrendBtn) viewTrendBtn.addEventListener("click", () => openTrendView("startSection"));
+  if (trendBackBtn) trendBackBtn.addEventListener("click", () => {
+    hide("trendSection"); show(lastSectionBeforeTrend);
+  });
 
   beginTestBtn.addEventListener("click", () => {
     const step = FLOW[flowIndex];
@@ -1022,7 +1353,7 @@ async function main() {
       }}); return;
     }
     if (step.key === "nback") {
-      runNBack({ rounds: 25, nBack: 2, onDone: (result) => {
+      runNBack({ rounds: 30, nBack: 2, onDone: (result) => {
         GAME_RESULTS.nback = result; flowIndex++;
         flowIndex < FLOW.length ? showExplanation(flowIndex) : showResultsScreen();
       }}); return;
@@ -1034,7 +1365,7 @@ async function main() {
       }}); return;
     }
     if (step.key === "pvt") {
-      runPVT({ durationSec: 60, minDelaySec: 2, maxDelaySec: 10, onDone: (result) => {
+      runPVT({ durationSec: 60, minDelaySec: 1, maxDelaySec: 4, onDone: (result) => {
         GAME_RESULTS.pvt = result; flowIndex++;
         flowIndex < FLOW.length ? showExplanation(flowIndex) : showResultsScreen();
       }}); return;
