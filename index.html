@@ -11,17 +11,11 @@
     <main class="container">
       <header class="header">
         <h1>Fatigue Check</h1>
-        <p class="sub">Quick pilot check-in + cognitive tests (60s each)</p>
+        <p class="sub">Quick check-in + cognitive tests (60s each)</p>
       </header>
 
       <!-- Alias -->
       <section id="aliasSection" class="card">
-        <!-- Data collection ended notice -->
-        <div style="background:#e8f5e9;border:1px solid #a5d6a7;border-radius:8px;padding:14px 18px;margin-bottom:18px;font-size:15px;line-height:1.6;color:#2e7d32;">
-          <b>Data collection has now ended.</b><br />
-          Thank you so much for your help over the last month. Your participation and feedback has been invaluable and is hugely appreciated. Every session has helped refine and improve the device, and I couldn't have done it without you - so thank you again!
-        </div>
-
         <h2>Enter your code</h2>
         <p class="hint">4 chars: 2 letters + 2 numbers (any order)</p>
         <div class="row">
@@ -42,13 +36,13 @@
       <!-- Check-in -->
       <section id="checkinSection" class="hidden card">
         <h2>Check-in</h2>
+        <p class="hint">This information is shown as context alongside your results — your score is based on test performance only.</p>
 
         <div class="grid">
           <label>How many hours did you sleep last night? (hours)
             <input id="sleepHours" type="number" min="0" max="24" step="0.5" />
           </label>
 
-          <!-- CHANGE 2: Broken sleep follow-up -->
           <fieldset style="border:none;margin:0;padding:0;">
             <legend style="font-size:inherit;font-weight:600;margin-bottom:4px;">Was your sleep broken?</legend>
             <label style="margin-right:16px;"><input type="radio" name="brokenSleep" id="brokenSleepYes" value="yes" /> Yes</label>
@@ -63,7 +57,6 @@
             <input id="hoursInto" type="number" min="0" max="24" step="0.5" />
           </label>
 
-          <!-- CHANGE 3: Caffeine clarification note -->
           <label>How much caffeine have you had in the last 4 hours?
             <span class="hint" style="display:block;font-weight:normal;font-size:13px;margin-top:2px;margin-bottom:4px;">This includes coffee, tea, energy drinks, and other caffeinated drinks.</span>
             <select id="caffeine">
@@ -79,7 +72,6 @@
             <input id="fatigue" type="number" min="0" max="10" step="1" />
           </label>
 
-          <!-- CHANGE 4: Removed "/alert" from motivation label -->
           <label>How motivated do you feel right now? (0–10) (0=not at all, 10=extremely)
             <input id="motivation" type="number" min="0" max="10" step="1" />
           </label>
@@ -88,7 +80,6 @@
             <input id="age" type="number" min="16" max="90" step="1" />
           </label>
 
-          <!-- CHANGE 1: Gender selection field after age -->
           <label>What is your gender?
             <select id="gender">
               <option value="">Select…</option>
@@ -125,6 +116,14 @@
           You'll complete 4 quick tests (60s each). Try to focus and respond as accurately as you can.
         </p>
         <button id="startSessionBtn">Start</button>
+        <button id="viewTrendBtn" class="secondary" style="margin-left:8px;">View my trend</button>
+      </section>
+
+      <!-- Trend view -->
+      <section id="trendSection" class="hidden card">
+        <h2>My trend — last 14 days</h2>
+        <div id="trendContent"></div>
+        <button id="trendBackBtn" class="secondary">Back</button>
       </section>
 
       <!-- Explanation -->
@@ -152,6 +151,6 @@
       </section>
     </main>
 
-    <script src="src/app.js?v=2"></script>
+    <script src="src/app.js?v=3"></script>
   </body>
 </html>
